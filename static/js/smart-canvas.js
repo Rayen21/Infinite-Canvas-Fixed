@@ -1172,6 +1172,15 @@ function persistActiveSmartSettings(){
     subject.runSettings = settingsForStorage(settings);
     rememberRecentSmartSettings(settings, subject);
 }
+function restoreSmartSettingsAfterRun(runNode, previousSettings){
+    const selected = selectedNode();
+    const activeSubject = isSmartRunnableNode(selected) ? selected : activeSettingsSubject();
+    if(activeSubject?.id === runNode?.id || !activeSubject){
+        settings = previousSettings;
+        return;
+    }
+    settings = smartSettingsForNode(activeSubject);
+}
 function rememberCanvasListProject(projectId){
     const pid = projectId || 'default';
     try { localStorage.setItem(CANVAS_LIST_PROJECT_KEY, pid); } catch(e){}
@@ -15178,37 +15187,37 @@ async function runGeneration(){
     if(smartNodeInFlight(node)) return;
     const refs = request.refs;
     const previousSettings = cloneSmartSettings(settings);
-    const runSettings = smartSettingsForNode(node);
+    const runSettings = cloneSmartSettings(smartSettingsForNode(node));
     settings = {...settings, ...cloneSmartSettings(runSettings || {})};
-    if(!prompt && smartRunNeedsPrompt(settings)){
-        settings = previousSettings;
+    if(!prompt && smartRunNeedsPrompt(runSettings)){
+        restoreSmartSettingsAfterRun(node, previousSettings);
         toast(tr('smart.toastNeedPrompt'));
         return;
     }
     const outpaintSize = node?.outpaintSize && Number(node.outpaintSize.width) > 0 && Number(node.outpaintSize.height) > 0
         ? {width:Math.round(Number(node.outpaintSize.width)), height:Math.round(Number(node.outpaintSize.height))}
         : null;
-    if(outpaintSize && isApiLikeEngine(settings.engine) && settings.apiKind !== 'video'){
-        settings = {
-            ...settings,
+    if(outpaintSize && isApiLikeEngine(runSettings.engine) && runSettings.apiKind !== 'video'){
+        Object.assign(runSettings, {
             resolution:'custom',
             ratio:'',
             customWidth:outpaintSize.width,
             customHeight:outpaintSize.height,
             customSize:`${outpaintSize.width}x${outpaintSize.height}`
-        };
+        });
+        settings = {...settings, ...cloneSmartSettings(runSettings)};
     }
     const meta = snapshotRunMeta(prompt, node.id, request.displayPrompt, refs);
-    const logKind = isApiLikeEngine(settings.engine) && settings.apiKind === 'video' ? 'video' : 'image';
+    const logKind = isApiLikeEngine(runSettings.engine) && runSettings.apiKind === 'video' ? 'video' : 'image';
     const runLog = smartRunSnapshot(node, prompt, refs, logKind);
-    rememberRecentSmartSettings(settings, node);
+    rememberRecentSmartSettings(runSettings, node);
     const runLogStart = nowMs();
-    const expectedCount = settings.engine === 'runninghub'
+    const expectedCount = runSettings.engine === 'runninghub'
         ? 1
-        : settings.engine === 'comfy'
-        ? (settings.comfyMode === 'text' || settings.comfyMode === 'enhance' || settings.comfyMode === 'edit' || settings.comfyMode === 'custom' ? 1 : 1)
-        : Math.max(1, Math.min(8, Number(settings.count || 1)));
-    const apiConcurrentRun = isApiLikeEngine(settings.engine) || settings.engine === 'runninghub' || settings.engine === 'modelscope' || settings.engine === 'comfy';
+        : runSettings.engine === 'comfy'
+        ? (runSettings.comfyMode === 'text' || runSettings.comfyMode === 'enhance' || runSettings.comfyMode === 'edit' || runSettings.comfyMode === 'custom' ? 1 : 1)
+        : Math.max(1, Math.min(8, Number(runSettings.count || 1)));
+    const apiConcurrentRun = isApiLikeEngine(runSettings.engine) || runSettings.engine === 'runninghub' || runSettings.engine === 'modelscope' || runSettings.engine === 'comfy';
     const nodeHasImages = isSmartGroupNode(node) ? imagesForNode(node).some(img => img?.url) : (node.images || []).some(img => img?.url);
     const workflowModeRun = smartImageUsesWorkflowInput(node, smartLoopContext);
     const sourceVisualState = isSmartImageNode(node) && nodeHasImages && !workflowModeRun ? {
@@ -15250,33 +15259,33 @@ async function runGeneration(){
     }
     render();
     try {
-        if(settings.engine === 'comfy'){
-            await runComfyGeneration(pendingNode, prompt, refs, pendingNode, pendingMeta);
+        if(runSettings.engine === 'comfy'){
+            await runComfyGeneration(pendingNode, prompt, refs, pendingNode, pendingMeta, runSettings);
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             addSmartGenerationLog({run:runLog, outputs:pendingNode.images || [], runMs:nowMs() - runLogStart});
-            settings = previousSettings;
+            restoreSmartSettingsAfterRun(node, previousSettings);
             return;
         }
-        if(isApiLikeEngine(settings.engine) && settings.apiKind === 'video'){
-            const outVideos = await runApiVideoGeneration(prompt, refs);
+        if(isApiLikeEngine(runSettings.engine) && runSettings.apiKind === 'video'){
+            const outVideos = await runApiVideoGeneration(prompt, refs, runSettings);
             if(!outVideos.length) throw new Error(tr('smart.errNoOutVideos'));
             finalizePendingNode(pendingNode, outVideos, pendingMeta, 'video');
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             addSmartGenerationLog({run:runLog, outputs:outVideos, runMs:nowMs() - runLogStart});
             clearPromptInput({preserveDraft:true});
-            settings = previousSettings;
+            restoreSmartSettingsAfterRun(node, previousSettings);
             scheduleSave();
             return;
         }
-        const rhModelMode = settings.engine === 'runninghub' && Boolean(runningHubSelectedModel(settings));
+        const rhModelMode = runSettings.engine === 'runninghub' && Boolean(runningHubSelectedModel(runSettings));
         const outImages = rhModelMode
-            ? await runApiGeneration(prompt, refs, runningHubModelApiSettings(settings))
-            : settings.engine === 'runninghub'
-                ? await runRunningHubGeneration(prompt, refs)
-                : settings.engine === 'modelscope'
-                ? await runModelscopeGeneration(prompt, refs)
-                : await runApiGeneration(prompt, refs);
-        if(isApiLikeEngine(settings.engine) || rhModelMode){
+            ? await runApiGeneration(prompt, refs, runningHubModelApiSettings(runSettings))
+            : runSettings.engine === 'runninghub'
+                ? await runRunningHubGeneration(prompt, refs, runSettings)
+                : runSettings.engine === 'modelscope'
+                ? await runModelscopeGeneration(prompt, refs, runSettings)
+                : await runApiGeneration(prompt, refs, runSettings);
+        if(isApiLikeEngine(runSettings.engine) || rhModelMode){
             const taskIds = Array.isArray(outImages?.taskIds) ? outImages.taskIds : [];
             if(!taskIds.length) throw new Error(tr('smart.errRunFailed'));
             pendingNode.pendingTasks = taskIds.map(taskId => ({taskId, kind:'image', providerId:outImages.providerId, model:outImages.model}));
@@ -15291,7 +15300,7 @@ async function runGeneration(){
             if(pendingNode.jimengPending || smartRecoverableImageTask(pendingNode)){
                 if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
                 clearPromptInput({preserveDraft:true});
-                settings = previousSettings;
+                restoreSmartSettingsAfterRun(node, previousSettings);
                 scheduleSave();
                 return;
             }
@@ -15300,7 +15309,7 @@ async function runGeneration(){
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             addSmartGenerationLog({run:runLog, outputs:pendingNode.images || [], runMs:nowMs() - runLogStart});
             clearPromptInput({preserveDraft:true});
-            settings = previousSettings;
+            restoreSmartSettingsAfterRun(node, previousSettings);
             scheduleSave();
             return;
         }
@@ -15310,10 +15319,10 @@ async function runGeneration(){
         if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
         addSmartGenerationLog({run:runLog, outputs:outImages, runMs:nowMs() - runLogStart});
         clearPromptInput({preserveDraft:true});
-        settings = previousSettings;
+        restoreSmartSettingsAfterRun(node, previousSettings);
         scheduleSave();
     } catch(e) {
-        settings = previousSettings;
+        restoreSmartSettingsAfterRun(node, previousSettings);
         if(handleJimengPendingSignal(pendingNode, e)){
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             delete pendingNode._runMetaTargetId;
@@ -15594,14 +15603,14 @@ async function runSmartComfyUpscale(imageUrl, resolution){
         client_id:smartClientId
     });
 }
-async function runComfyGeneration(node, prompt, refs, pendingNode, meta){
+async function runComfyGeneration(node, prompt, refs, pendingNode, meta, runSettings=settings){
     const allRefs = refs || [];
     refs = imageRefsOnly(allRefs);
-    const mode = settings.comfyMode || 'text';
-    if(mode === 'text') return runComfyText(node, prompt, pendingNode, meta);
-    if(mode === 'enhance') return runComfyEnhance(node, refs, pendingNode, meta);
-    if(mode === 'edit') return runComfyEdit(node, prompt, refs, pendingNode, meta);
-    const workflowName = settings.comfyWorkflow || comfyWorkflows[0]?.name || '';
+    const mode = runSettings.comfyMode || 'text';
+    if(mode === 'text') return runComfyText(node, prompt, pendingNode, meta, runSettings);
+    if(mode === 'enhance') return runComfyEnhance(node, refs, pendingNode, meta, runSettings);
+    if(mode === 'edit') return runComfyEdit(node, prompt, refs, pendingNode, meta, runSettings);
+    const workflowName = runSettings.comfyWorkflow || comfyWorkflows[0]?.name || '';
     if(!workflowName) throw new Error(tr('smart.errNeedWorkflow'));
     const wf = await fetch(`/api/workflows/${encodeURIComponent(workflowName)}`).then(async r => {
         if(!r.ok) throw new Error(await r.text());
@@ -15621,10 +15630,10 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta){
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'video'), videoRefsOnly(allRefs));
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'audio'), audioRefsOnly(allRefs));
     fields.filter(f => comfyFieldKind(f) === 'setting').forEach(field => {
-        if(comfyRandomEnabledField(field) && smartComfyRandomActive(field.id)){
+        if(comfyRandomEnabledField(field) && smartComfyRandomActiveFor(runSettings, field.id)){
             values[field.id] = smartComfyRandomValue(field);
         } else {
-            values[field.id] = settings.comfyParams?.[field.id] ?? field.default;
+            values[field.id] = runSettings.comfyParams?.[field.id] ?? field.default;
         }
     });
     const result = await runQueuedSmartComfyGenerate({prompt, workflow_json:workflowName, params:comfyParamsFromWorkflowValues(wf.config || {fields:[]}, values), type:'workflow-custom', client_id:smartClientId});
@@ -15645,8 +15654,8 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta){
     clearPromptInput({preserveDraft:true});
     scheduleSave();
 }
-async function runComfyText(node, prompt, pendingNode, meta){
-    const data = await runQueuedSmartComfyGenerate({prompt, width:Number(settings.width || 1024), height:Number(settings.height || 1024), workflow_json:'Z-Image.json', type:'zimage', client_id:smartClientId});
+async function runComfyText(node, prompt, pendingNode, meta, runSettings=settings){
+    const data = await runQueuedSmartComfyGenerate({prompt, width:Number(runSettings.width || 1024), height:Number(runSettings.height || 1024), workflow_json:'Z-Image.json', type:'zimage', client_id:smartClientId});
     const out = data.outputs || data.images || [];
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
     if(pendingNode){
@@ -15659,14 +15668,14 @@ async function runComfyText(node, prompt, pendingNode, meta){
     clearPromptInput({preserveDraft:true});
     scheduleSave();
 }
-async function runComfyEnhance(node, refs, pendingNode, meta){
+async function runComfyEnhance(node, refs, pendingNode, meta, runSettings=settings){
     if(!refs.length) throw new Error(tr('smart.errEnhanceNeedRefs'));
     const inputName = await comfyNameForRef(refs[0]);
-    const data = await runQueuedSmartComfyGenerate({workflow_json:'Z-Image-Enhance.json', type:'enhance', params:{"15":{image:inputName},"204":{value:Number(settings.enhanceStrength ?? 0.5)}}, client_id:smartClientId});
+    const data = await runQueuedSmartComfyGenerate({workflow_json:'Z-Image-Enhance.json', type:'enhance', params:{"15":{image:inputName},"204":{value:Number(runSettings.enhanceStrength ?? 0.5)}}, client_id:smartClientId});
     //修复超分勾选
     let out = data.outputs || data.images || [];
-    if(settings.enhanceUpscale && out[0]){
-        const upscale = await runSmartComfyUpscale(out[0], settings.enhanceUpscaleRes || 2048);
+    if(runSettings.enhanceUpscale && out[0]){
+        const upscale = await runSmartComfyUpscale(out[0], runSettings.enhanceUpscaleRes || 2048);
         out = upscale.outputs || upscale.images || [];
     }
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
@@ -15679,15 +15688,15 @@ async function runComfyEnhance(node, refs, pendingNode, meta){
     }
     scheduleSave();
 }
-async function runComfyEdit(node, prompt, refs, pendingNode, meta){
+async function runComfyEdit(node, prompt, refs, pendingNode, meta, runSettings=settings){
     if(!refs.length) throw new Error(tr('smart.errEditNeedRefs'));
     const names = [];
     for(const ref of refs.slice(0, 3)) names.push(await comfyNameForRef(ref));
     const data = await runQueuedSmartComfyGenerate({prompt, workflow_json:'Flux2-Klein.json', type:'klein', params:{"168":{text:prompt},"158":{noise_seed:Math.floor(Math.random()*1000000)},"278":{image:names[0] || ""},"270":{image:names[1] || ""},"292":{image:names[2] || ""},"313":{value:Boolean(names[1])},"314":{value:Boolean(names[2])}}, client_id:smartClientId});
     //修复超分勾选
     let out = data.outputs || data.images || [];
-    if(settings.editUpscale && out[0]){
-        const upscale = await runSmartComfyUpscale(out[0], settings.editUpscaleRes || 2048);
+    if(runSettings.editUpscale && out[0]){
+        const upscale = await runSmartComfyUpscale(out[0], runSettings.editUpscaleRes || 2048);
         out = upscale.outputs || upscale.images || [];
     }
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
