@@ -74,8 +74,6 @@ let nodes = [];
 let selectedId = '';
 let selectedIds = [];
 let selectedImage = {nodeId:'', index:-1};
-const localUnsyncedNodeIds = new Set();
-const localDeletedNodeIds = new Set();
 let dragState = null;
 let loopInsertPreview = null;
 let selectionState = null;
@@ -99,7 +97,6 @@ let apiProviders = [];
 let comfyWorkflows = [];
 let comfyInstanceCount = 1;
 let assetLibrary = {categories:[]};
-let assetUrlLibrary = {items:[], updated_at:0};
 let assetLibraryOpen = false;
 let assetTab = 'image';
 let activeAssetCategoryId = '';
@@ -135,12 +132,6 @@ let imageClickTimer = null;
 let suppressImageClickUntil = 0;
 let lastMouseWorld = null;
 let lastConfigRefreshAt = 0;
-const SMART_CONFIG_FOCUS_REFRESH_MS = 30000;
-let smartConfigRefreshPromise = null;
-let smartConfigRefreshTimer = 0;
-let smartConfigSignatureValue = '';
-const SMART_API_CONFIG_EVENT_TYPES = new Set(['providers-changed','workflows-changed','comfy-instances-changed']);
-const smartApiConfigEventsSeen = new Map();
 let smartMinimapState = null;
 let smartMinimapDrag = false;
 let zoomPreviewState = null;
@@ -438,11 +429,15 @@ async function clipboardMatchesText(value){
 async function copyTextToClipboard(text){
     const value = String(text || '');
     if(!value) return false;
-    if(copyTextWithCopyEvent(value) || copyTextWithTextarea(value)) return true;
+    if(copyTextWithCopyEvent(value) || copyTextWithTextarea(value)){
+        const verified = await clipboardMatchesText(value);
+        return verified !== false;
+    }
     try {
         if(navigator.clipboard?.writeText && window.isSecureContext !== false){
             await navigator.clipboard.writeText(value);
-            return true;
+            const verified = await clipboardMatchesText(value);
+            return verified !== false;
         }
     } catch(_) {}
     return false;
@@ -610,10 +605,8 @@ function smartImageNearViewport(img){
     const shellRect = shell.getBoundingClientRect();
     const rect = img.getBoundingClientRect();
     const margin = 220;
-    return rect.right >= shellRect.left - margin
-        && rect.left <= shellRect.right + margin
-        && rect.bottom >= shellRect.top - margin
-        && rect.top <= shellRect.bottom + margin;
+    return rect.right >= shellRect.left - margin && rect.left <= shellRect.right + margin
+        && rect.bottom >= shellRect.top - margin && rect.top <= shellRect.bottom + margin;
 }
 function syncSmartSelectedImageResolution(root=null){
     const selectedImages = [];
@@ -641,6 +634,7 @@ function syncSmartSelectedImageResolution(root=null){
     });
     if(smartSelectedHighResTimer) clearTimeout(smartSelectedHighResTimer);
     const seq = ++smartSelectedHighResSeq;
+    smartSelectedHighResNodeIds = new Set(selectedNodeIds());
     if(!selectedImages.length || smartImageEditorIsOpen()) return;
     smartSelectedHighResTimer = setTimeout(async () => {
         smartSelectedHighResTimer = 0;
@@ -722,7 +716,6 @@ function mediaItemForStorage(item){
 function canvasForStorage(){
     const clean = JSON.parse(JSON.stringify(canvas || {}));
     clean.settings = settingsForStorage(canvasDefaultSmartSettings || initialSmartSettings);
-    clean.deleted_node_ids = [...localDeletedNodeIds].slice(-2000);
     // 日志预览的临时节点（编辑器打开期间临时塞进 nodes）绝不能被持久化，否则刷新后会留下幽灵节点。
     if(Array.isArray(clean.nodes)) clean.nodes = clean.nodes.filter(node => node.id !== SMART_LOG_PREVIEW_NODE_ID);
     (clean.nodes || []).forEach(node => {
@@ -2094,13 +2087,6 @@ function screenToWorld(event){
         y:(event.clientY - rect.top - viewport.y) / viewport.scale
     };
 }
-function canvasWheelZoomFactor(event, pageSize){
-    const unit = event.deltaMode === 1 ? 40 : event.deltaMode === 2 ? pageSize : 1;
-    const isMac = /^Mac/.test(navigator.platform || '');
-    const sensitivity = 0.0008;
-    const macMultiplier = isMac ? 1.15 : 1;
-    return Math.exp(-event.deltaY * unit * sensitivity * macMultiplier);
-}
 function viewportCenter(){
     return {
         x:(shell.clientWidth / 2 - viewport.x) / viewport.scale,
@@ -2139,30 +2125,6 @@ function renderMinimap(){
     const view = project({x:viewX, y:viewY, width:viewW, height:viewH});
     minimapContent.innerHTML = `${nodeHtml}<div id="minimapViewport" class="smart-minimap-viewport" style="left:${view.left}px;top:${view.top}px;width:${view.width}px;height:${view.height}px"></div>`;
     minimapViewport = document.getElementById('minimapViewport');
-}
-let smartPostRenderMediaTimer = 0;
-let smartPostRenderMediaIdle = 0;
-let smartPostRenderMediaSeq = 0;
-function scheduleSmartPostRenderMediaWork(){
-    if(smartPostRenderMediaTimer){
-        clearTimeout(smartPostRenderMediaTimer);
-        smartPostRenderMediaTimer = 0;
-    }
-    if(smartPostRenderMediaIdle && window.cancelIdleCallback){
-        window.cancelIdleCallback(smartPostRenderMediaIdle);
-        smartPostRenderMediaIdle = 0;
-    }
-    const seq = ++smartPostRenderMediaSeq;
-    const run = () => {
-        smartPostRenderMediaTimer = 0;
-        smartPostRenderMediaIdle = 0;
-        if(seq !== smartPostRenderMediaSeq || !world?.isConnected) return;
-        bindSmartPreviewImageFallbacks(world);
-        syncSmartSelectedImageResolution(world);
-        measureSmartNodeImages();
-    };
-    if(window.requestIdleCallback) smartPostRenderMediaIdle = window.requestIdleCallback(run, {timeout:260});
-    else smartPostRenderMediaTimer = setTimeout(run, 80);
 }
 function minimapEventToWorld(event){
     if(!smartMinimapState) renderMinimap();
@@ -2427,17 +2389,15 @@ function providerImageModels(providerId){
     if(providerId === 'volcengine') return volcengineProvider().image_models || [];
     return (apiProviders || []).find(p => p.id === providerId)?.image_models || [];
 }
-// 即梦 image_upscale 支持的放大分辨率（与后端 JIMENG_UPSCALE_RESOLUTIONS 保持一致）
 const JIMENG_UPSCALE_RESOLUTIONS = ['2k', '4k', '8k'];
-function jimengImageProviderId(){
-    const provider = imageProviders().find(p => isJimengProviderId(p.id));
-    return provider?.id || (isJimengProviderId(settings.provider_id) ? settings.provider_id : '');
-}
 function isJimengProviderId(providerId){
     const id = String(providerId || '').trim().toLowerCase();
-    const provider = (apiProviders || []).find(p => String(p.id || '').trim().toLowerCase() === id);
-    const protocol = String(provider?.protocol || '').trim().toLowerCase();
-    return id === 'jimeng' || protocol === 'jimeng';
+    const provider = (apiProviders || []).find(item => String(item.id || '').trim().toLowerCase() === id);
+    return id === 'jimeng' || String(provider?.protocol || '').trim().toLowerCase() === 'jimeng';
+}
+function jimengImageProviderId(){
+    const provider = imageProviders().find(item => isJimengProviderId(item.id));
+    return provider?.id || (isJimengProviderId(settings.provider_id) ? settings.provider_id : '');
 }
 // 即梦图生图（挂了参考图）不支持 3.0/3.1，此时从模型下拉里隐藏它们。
 const JIMENG_IMAGE2IMAGE_UNSUPPORTED = ['3.0', '3.1'];
@@ -2471,8 +2431,8 @@ const JIMENG_SEEDANCE_VIDEO_MODELS = ['seedance2.0_vip', 'seedance2.0fast_vip', 
 const JIMENG_VIDEO_MODELS_BY_COMMAND = {
     text2video: JIMENG_SEEDANCE_VIDEO_MODELS,
     multimodal2video: JIMENG_SEEDANCE_VIDEO_MODELS,
-    image2video: ['seedance1.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
-    frames2video: ['seedance1.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
+    image2video: ['3.0', '3.0fast', '3.0pro', '3.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
+    frames2video: ['3.0', '3.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
 };
 function jimengVideoCommand(){
     const node = activeComposerNode() || selectedNode();
@@ -2552,11 +2512,7 @@ function videoProviderById(providerId){
 function providerVideoModels(providerId){
     if(providerId === 'volcengine') return volcengineVideoModels();
     const provider = videoApiProviders().find(p => p.id === providerId);
-    // API 设置页与画布页各自维护一份前端状态；即梦 CLI 的模型集合是本地固定能力，
-    // 因此节点侧要把已拉取列表与当前 CLI 支持列表合并，避免旧缓存漏掉新模型。
-    const models = isJimengProviderId(providerId)
-        ? [...(provider?.video_models || []), ...JIMENG_SEEDANCE_VIDEO_MODELS]
-        : (provider?.video_models || DEFAULT_VIDEO_MODELS);
+    const models = provider?.video_models || DEFAULT_VIDEO_MODELS;
     return [...new Set(models)];
 }
 function volcengineVideoModels(){
@@ -2621,7 +2577,7 @@ function renderVideoAspectControl(){
     </div>`;
 }
 function renderVideoResolutionControl(){
-    const options = [['', tr('smart.videoResAuto')], ['720p','720P'], ['1080p','1080P'], ['4k','4K']];
+    const options = [['', tr('smart.videoResAuto')], ['480p','480P'], ['720p','720P'], ['1080p','1080P']];
     const value = settings.videoResolution || '';
     const labelMap = Object.fromEntries(options);
     return `<div class="smart-control resolution-control">
@@ -2652,6 +2608,8 @@ function renderVideoTrustedAssetControl(){
     const src = ['library','cloud','manual'].includes(settings.videoTrustedSource) ? settings.videoTrustedSource : 'library';
     html += `<div class="trusted-source-row">
         <button type="button" class="smart-pill trusted-src-pill ${src === 'library' ? 'active' : ''}" data-trusted-source="library" title="使用素材库中已注册的认证素材链接（asset://）"><i data-lucide="library"></i><span>素材库链接</span></button>
+        <button type="button" class="smart-pill trusted-src-pill ${src === 'cloud' ? 'active' : ''}" data-trusted-source="cloud" title="把当前输入图片/视频上传到云端直链"><i data-lucide="upload-cloud"></i><span>上传云端</span></button>
+        <button type="button" class="smart-pill trusted-src-pill ${src === 'manual' ? 'active' : ''}" data-trusted-source="manual" title="手动输入媒体 URL 或 asset:// 地址"><i data-lucide="link"></i><span>输入网址</span></button>
     </div>`;
     return html;
 }
@@ -2716,7 +2674,6 @@ function updateProviderModels(){ renderDynamicParams(); }
 let dynamicParamsRefreshTimer = 0;
 let dynamicParamsRefreshIdle = 0;
 let dynamicParamsRefreshSeq = 0;
-let dynamicParamsRenderKey = '';
 function scheduleDynamicParamsRefresh(delay=120){
     if(dynamicParamsRefreshTimer){
         clearTimeout(dynamicParamsRefreshTimer);
@@ -2741,30 +2698,6 @@ function scheduleDynamicParamsRefresh(delay=120){
 }
 function controlTypeKey(el){
     return el ? Array.from(el.classList).find(c => c !== 'smart-control' && c.endsWith('-control')) || '' : '';
-}
-function dynamicParamsStateKey(){
-    const providerSig = (apiProviders || []).map(provider => [
-        provider.id || '',
-        provider.name || '',
-        provider.enabled === false ? '0' : '1',
-        provider.protocol || '',
-        (provider.image_models || []).join('|'),
-        (provider.video_models || []).join('|'),
-        (provider.chat_models || []).join('|'),
-        (provider.rh_apps || []).map(item => item?.appId || item?.webappId || item?.id || '').join('|'),
-        (provider.rh_workflows || []).map(item => item?.workflowId || item?.id || '').join('|')
-    ].join('~')).join('||');
-    const workflowSig = (comfyWorkflows || []).map(workflow => `${workflow.name || ''}:${workflow.title || ''}`).join('|');
-    return JSON.stringify({
-        settings:settingsForStorage(settings),
-        providerSig,
-        workflowSig,
-        comfyInstanceCount,
-        lang:window.StudioI18n?.lang?.() || '',
-        jimengEditMode:jimengImageEditMode(),
-        jimengVideoCommand:jimengVideoCommand(),
-        sourceRatio:sourceImageRatioLabel('')
-    });
 }
 // 记住重渲染前哪个控件的弹层是打开的：pinned=点击药丸锁定，interacting=悬浮打开后点了里面的参数。
 // 重渲染会重建 DOM、丢掉这两个状态，所以渲染后要按原样恢复，否则点一下就收起来了。
@@ -2815,22 +2748,13 @@ function restoreDynamicParamsScroll(snapshot){
     apply();
     requestAnimationFrame(apply);
 }
-function renderDynamicParams(options={}){
+function renderDynamicParams(){
     if(!dynamicParams) return;
     const keepOpen = openControlState();
     const scrollState = dynamicParamsScrollSnapshot();
     settings.engine = ['api','volcengine','modelscope','comfy','runninghub'].includes(settings.engine) ? settings.engine : 'api';
     settings.apiKind = settings.apiKind === 'video' ? 'video' : 'image';
     clearVolcengineSelectionOutsideVolcengine(settings);
-    const renderKey = dynamicParamsStateKey();
-    if(!options.force && dynamicParamsRenderKey === renderKey && dynamicParams.children.length){
-        engineSelect.value = settings.engine;
-        syncApiKindToggleVisibility();
-        updatePromptPlaceholder();
-        persistActiveSmartSettings();
-        return;
-    }
-    dynamicParamsRenderKey = renderKey;
     engineSelect.value = settings.engine;
     syncApiKindToggleVisibility();
     if(settings.engine === 'api'){
@@ -2868,17 +2792,12 @@ function renderApiParams(){
         ${isJimengProviderId(settings.provider_id) ? renderJimengUpscaleControl() : ''}
     `;
 }
-// 即梦 image_upscale 的分辨率设置（2k/4k/8k）。此处只保存选择；实际放大在图片节点工具栏「放大」按钮触发。
 function renderJimengUpscaleControl(){
-    const opts = ['2k', '4k', '8k'];
     const current = JIMENG_UPSCALE_RESOLUTIONS.includes(settings.jimengUpscaleRes) ? settings.jimengUpscaleRes : '2k';
     return `<div class="smart-control upscale-control jimeng-upscale-control">
         <button class="smart-pill" type="button" title="${escapeAttr(tr('smart.jimengUpscale'))}"><i data-lucide="maximize-2"></i><span>${escapeHtml(tr('smart.jimengUpscale'))} · ${escapeHtml(current.toUpperCase())}</span><i data-lucide="chevron-down" class="pill-caret"></i></button>
-        <div class="smart-popover compact-popover">
-            <div class="smart-popover-title">${escapeHtml(tr('smart.upscaleTarget'))}</div>
-            <div class="model-list">
-                ${opts.map(v => `<button type="button" class="direct-option ${v === current ? 'active' : ''}" data-smart-param="jimengUpscaleRes" data-smart-value="${escapeHtml(v)}"><span>${escapeHtml(v.toUpperCase())}</span></button>`).join('')}
-            </div>
+        <div class="smart-popover compact-popover"><div class="smart-popover-title">${escapeHtml(tr('smart.upscaleTarget'))}</div>
+            <div class="model-list">${JIMENG_UPSCALE_RESOLUTIONS.map(value => `<button type="button" class="direct-option ${value === current ? 'active' : ''}" data-smart-param="jimengUpscaleRes" data-smart-value="${escapeHtml(value)}"><span>${escapeHtml(value.toUpperCase())}</span></button>`).join('')}</div>
         </div>
     </div>`;
 }
@@ -3696,7 +3615,7 @@ function currentSmartMediaLinks(node=null){
     }).filter(Boolean);
 }
 function clearManualSmartVideoUrl(){
-    settings.videoTempShLinks = (settings.videoTempShLinks || []).filter(item => item?.manual !== true || item?.uploaded === true);
+    settings.videoTempShLinks = (settings.videoTempShLinks || []).filter(item => item?.manual !== true);
 }
 function splitManualMediaUrls(text){
     return String(text || '')
@@ -3724,13 +3643,6 @@ async function uploadMediaRefToCloud(ref){
         ...(transientSmartCloudLinks || []).filter(item => item?.source !== sourceUrl),
         {source:sourceUrl, url:uploadedUrl, expires:data.expires || '3 days', kind}
     ];
-    settings.videoTempShLinks = [
-        ...(settings.videoTempShLinks || []).filter(item => item?.source !== sourceUrl),
-        {source:sourceUrl, url:uploadedUrl, manual:true, uploaded:true, expires:data.expires || '3 days', kind}
-    ];
-    saveUrlsToAssetUrlLibrary([uploadedUrl], [ref.name || data.name || fileNameFromUrl(uploadedUrl) || 'cloud-url']).catch(() => {});
-    persistActiveSmartSettings();
-    scheduleSave();
     return uploadedUrl;
 }
 function applyManualVideoUrlToSmartRef(ref, manualUrl){
@@ -3772,27 +3684,16 @@ async function setCurrentSmartManualVideoUrl(){
         toast('请输入 http/https 媒体网址或 asset:// 火山素材 URI');
         return '';
     }
-    pushUndo();
-    urls.forEach((url, index) => {
-        addManualReferenceToNode(node, {
-            url,
-            name:fileNameFromUrl(url) || `URL ${index + 1}`,
-            kind:smartManualUrlKind(url, 'image'),
-            mediaInstanceId:uid('manual_url')
-        }, {undo:false, closePicker:false, render:false, save:false});
-    });
     clearManualSmartVideoUrl();
     const targets = refs.length ? refs : [firstAny].filter(Boolean);
     urls.forEach((url, index) => {
         const target = targets[index] || targets[targets.length - 1] || {url};
         applyManualVideoUrlToSmartRef(target, url);
     });
-    saveUrlsToAssetUrlLibrary(urls).catch(() => {});
     persistActiveSmartSettings();
     scheduleSave();
-    renderInputThumbsRow(node);
     render();
-    toast(`已添加 ${urls.length} 个 URL 参考素材`);
+    toast(`已设置 ${urls.length} 个媒体网址`);
     return urls[0] || '';
 }
 async function uploadCurrentSmartVideosToCloud(){
@@ -4257,55 +4158,14 @@ function bindDynamicParams(){
         };
     });
 }
-function smartConfigSignature(){
-    const providerSig = (apiProviders || []).map(provider => ({
-        id:provider.id || '',
-        name:provider.name || '',
-        enabled:provider.enabled !== false,
-        protocol:provider.protocol || '',
-        image:(provider.image_models || []).join('|'),
-        chat:(provider.chat_models || []).join('|'),
-        video:(provider.video_models || []).join('|'),
-        rhApps:(provider.rh_apps || []).map(item => item?.appId || item?.webappId || item?.id || '').join('|'),
-        rhWorkflows:(provider.rh_workflows || []).map(item => item?.workflowId || item?.id || '').join('|')
-    }));
-    const workflowSig = (comfyWorkflows || []).map(workflow => `${workflow.name || ''}:${workflow.title || ''}`).join('|');
-    return JSON.stringify({providers:providerSig, workflows:workflowSig, comfyInstanceCount});
-}
-function scheduleSmartConfigRefresh(delay=220){
-    if(smartConfigRefreshTimer) clearTimeout(smartConfigRefreshTimer);
-    smartConfigRefreshTimer = setTimeout(() => {
-        smartConfigRefreshTimer = 0;
-        refreshSmartConfigFromSettings();
-    }, Math.max(0, Number(delay) || 0));
-}
-function shouldHandleSmartApiConfigEvent(data){
-    if(!SMART_API_CONFIG_EVENT_TYPES.has(data?.type)) return false;
-    const key = [data.type, data.updated_at || '', data.source || ''].join('|');
-    const now = Date.now();
-    const last = smartApiConfigEventsSeen.get(key) || 0;
-    if(last && now - last < 1200) return false;
-    smartApiConfigEventsSeen.set(key, now);
-    if(smartApiConfigEventsSeen.size > 40) {
-        Array.from(smartApiConfigEventsSeen.entries()).forEach(([eventKey, at]) => {
-            if(now - at > 2500) smartApiConfigEventsSeen.delete(eventKey);
-        });
-    }
-    return true;
-}
-function scheduleSmartConfigRefreshFromEvent(data, delay=520){
-    if(!shouldHandleSmartApiConfigEvent(data)) return;
-    scheduleSmartConfigRefresh(delay);
-}
-async function loadConfig(options={}){
-    const renderDuringLoad = options.renderDuringLoad !== false;
+async function loadConfig(){
     try {
         const cfg = await fetch('/api/config').then(r => r.json());
         apiProviders = Array.isArray(cfg.api_providers) ? cfg.api_providers : [];
         comfyInstanceCount = Math.max(1, (Array.isArray(cfg.comfy_instances) ? cfg.comfy_instances : []).filter(Boolean).length || 1);
         // 提供商配置已就绪即先渲染参数面板，避免等工作流/RunningHub 预取完成后参数才「突然刷新出来」。
         sanitizeSmartApiSelection(settings);
-        if(renderDuringLoad) updateProviderModels();
+        updateProviderModels();
         const wf = await fetch('/api/workflows').then(r => r.json()).catch(() => ({workflows:[]}));
         comfyWorkflows = Array.isArray(wf.workflows) ? wf.workflows : [];
         runningHubWorkflowCache = {};
@@ -4316,29 +4176,19 @@ async function loadConfig(options={}){
         }));
         lastConfigRefreshAt = Date.now();
         sanitizeSmartApiSelection(settings);
-        smartConfigSignatureValue = smartConfigSignature();
-        if(renderDuringLoad) updateProviderModels();
+        updateProviderModels();
     } catch(e) {
         toast(tr('smart.toastApiSettingsFail'));
     }
 }
 async function refreshSmartConfigFromSettings(){
-    if(smartConfigRefreshPromise) return smartConfigRefreshPromise;
-    smartConfigRefreshPromise = (async () => {
-        const before = smartConfigSignatureValue || smartConfigSignature();
-        await loadConfig({renderDuringLoad:false});
-        const changed = before !== smartConfigSignatureValue;
-        if(!changed) return;
-        renderDynamicParams();
-        const node = selectedNode();
-        if(node?.type === 'smart-prompt') {
-            applySettingsToNode(node);
-            render();
-        }
-    })().finally(() => {
-        smartConfigRefreshPromise = null;
-    });
-    return smartConfigRefreshPromise;
+    await loadConfig();
+    renderDynamicParams();
+    const node = selectedNode();
+    if(node?.type === 'smart-prompt') {
+        applySettingsToNode(node);
+        render();
+    }
 }
 function loadPromptPresets(){
     try {
@@ -5129,13 +4979,11 @@ function setActiveAssetTabCategory(categoryId=''){
 }
 async function loadAssetLibrary(){
     try {
-        const [data, localData, urlData] = await Promise.all([
+        const [data, localData] = await Promise.all([
             fetch('/api/asset-library').then(r => r.json()),
-            fetch('/api/local-assets').then(r => r.ok ? r.json() : {items:[], tree:null}).catch(() => ({items:[], tree:null})),
-            fetch('/api/asset-url-library').then(r => r.ok ? r.json() : {library:{items:[], updated_at:0}}).catch(() => ({library:{items:[], updated_at:0}}))
+            fetch('/api/local-assets').then(r => r.ok ? r.json() : {items:[], tree:null}).catch(() => ({items:[], tree:null}))
         ]);
         localAssetLibrary = {items:Array.isArray(localData.items) ? localData.items : [], tree:localData.tree || null};
-        assetUrlLibrary = urlData.library || urlData || {items:[], updated_at:0};
         setAssetLibraryFromResponse(data, {render:false});
         renderAssetLibrary();
     } catch(e) {
@@ -5350,10 +5198,8 @@ function mergeSmartNodeLists(localNodes, remoteNodes){
     (localNodes || []).forEach(n => { if(!seen.has(n.id)){ seen.add(n.id); order.push(n.id); } });
     (remoteNodes || []).forEach(n => { if(!seen.has(n.id)){ seen.add(n.id); order.push(n.id); } });
     return order.map(id => {
-        if(localDeletedNodeIds.has(id)) return null;
         const local = localById.get(id);
         const remote = remoteById.get(id);
-        if(local && !remote && localUnsyncedNodeIds.has(id)) return local;
         if(local && !remote) return local;     // 仅本地存在：保留（我新建的节点；对方删了也宁可复活也不丢结果）
         if(remote && !local) return remote;     // 仅对方存在：加入对方新建的节点
         return mergeSmartNode(local, remote);
@@ -5373,10 +5219,6 @@ function mergeSmartConnections(localConns, remoteConns, nodeIds){
 }
 function applyMergedServerCanvas(serverCanvas){
     if(!serverCanvas || !canvas) return false;
-    (serverCanvas.deleted_node_ids || []).forEach(id => {
-        const value = String(id || '').trim();
-        if(value) localDeletedNodeIds.add(value);
-    });
     const remoteNodes = (Array.isArray(serverCanvas.nodes) ? serverCanvas.nodes : []).map(normalizeLegacySmartNode).filter(Boolean);
     const mergedNodes = mergeSmartNodeLists(nodes, remoteNodes);
     const nodeIds = new Set(mergedNodes.map(n => n.id));
@@ -5513,25 +5355,12 @@ function assetMediaKind(item){
     if(item.kind === 'workflow' || item.type === 'workflow') return 'workflow';
     if(item.kind === 'video' || item.type === 'video') return 'video';
     if(item.kind === 'audio' || item.type === 'audio') return 'audio';
-    if(item.kind === 'text' || item.type === 'text') return 'text';
     const url = String(item.url || item.thumbnail || '').toLowerCase().split('?')[0];
     const name = String(item.name || '').toLowerCase();
-    if(url.includes('/video/') || name.includes('/video/')) return 'video';
-    if(url.includes('/audio/') || name.includes('/audio/')) return 'audio';
-    if(url.includes('/image/') || name.includes('/image/')) return 'image';
     if(/\.(mp4|webm|mov|m4v|avi|mkv)$/.test(url) || /\.(mp4|webm|mov|m4v|avi|mkv)$/.test(name)) return 'video';
     if(/\.(mp3|wav|m4a|aac|ogg|flac)$/.test(url) || /\.(mp3|wav|m4a|aac|ogg|flac)$/.test(name)) return 'audio';
-    if(/\.(txt|csv|srt|vtt|md)$/.test(url) || /\.(txt|csv|srt|vtt|md)$/.test(name)) return 'text';
     if(/\.(json|zip)$/.test(url) || /\.(json|zip)$/.test(name)) return 'workflow';
     return 'image';
-}
-function smartManualUrlKind(url, fallback='image'){
-    const text = String(url || '').trim().toLowerCase().split('?')[0].split('#')[0];
-    if(!text) return fallback;
-    if(text.includes('/video/') || /\.(mp4|webm|mov|m4v|avi|mkv)$/.test(text)) return 'video';
-    if(text.includes('/audio/') || /\.(mp3|wav|m4a|aac|ogg|flac)$/.test(text)) return 'audio';
-    if(text.includes('/image/') || /\.(png|jpe?g|webp|gif|bmp|tiff|avif)$/.test(text)) return 'image';
-    return fallback;
 }
 function assetNodeImageFromItem(item, fallbackName='asset'){
     const image = {
@@ -5562,7 +5391,6 @@ function assetThumbHtml(item){
 function renderAssetLibrary(){
     if(!assetPanel || !assetGrid || !assetCategorySelect) return;
     document.querySelectorAll('[data-asset-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.assetTab === assetTab));
-    const urlMode = assetTab === 'url';
     const libs = currentAssetSourceLibraries();
     if(!activeAssetLibraryId || !libs.some(lib => lib.id === activeAssetLibraryId)) activeAssetLibraryId = assetLibrary.active_library_id || assetLibraries()[0]?.id || LOCAL_ASSET_LIBRARY_ID;
     if(assetLibrarySelect){
@@ -5572,14 +5400,9 @@ function renderAssetLibrary(){
     const workflowMode = assetTab === 'workflow';
     assetImageControls.style.display = (imageMode || workflowMode) ? 'block' : 'none';
     const localMode = assetLibraryIsLocal();
-    assetDropZone.style.display = (imageMode || urlMode) ? 'flex' : 'none';
-    assetDropZone.textContent = urlMode ? '把图片拖到这里上传为 URL 素材' : tr('smart.assetDropHint');
-    assetGrid.style.display = (imageMode || workflowMode || urlMode) ? 'grid' : 'none';
+    assetDropZone.style.display = imageMode ? 'flex' : 'none';
+    assetGrid.style.display = (imageMode || workflowMode) ? 'grid' : 'none';
     workflowEmpty.style.display = 'none';
-    if(urlMode){
-        renderAssetUrlLibrary();
-        return;
-    }
     if(!imageMode && !workflowMode){ refreshIcons(); return; }
     const baseCats = workflowMode ? workflowAssetCategories() : assetCategories('image');
     const smartClassCats = imageMode && !localMode ? assetSmartClassEntries().map(entry => ({
@@ -5618,336 +5441,6 @@ function renderAssetLibrary(){
     else bindAssetItemEvents();
     bindSmartPreviewImageFallbacks(assetGrid);
     refreshIcons();
-}
-function assetUrlLibraryItems(){
-    return (Array.isArray(assetUrlLibrary?.items) ? assetUrlLibrary.items : [])
-        .filter(item => item?.url)
-        .map((item, index) => ({
-            ...item,
-            id:item.id || `url_${index}`,
-            kind:item.kind || smartManualUrlKind(item.url, 'image'),
-            name:item.name || fileNameFromUrl(item.url || '') || `URL ${index + 1}`
-        }));
-}
-function setAssetUrlLibraryFromResponse(data, options={}){
-    assetUrlLibrary = data.library || data || {items:[], updated_at:0};
-    if(options.render !== false) renderAssetLibrary();
-}
-async function saveUrlsToAssetUrlLibrary(urls=[], names=[]){
-    const cleanUrls = (urls || []).map(url => String(url || '').trim()).filter(Boolean);
-    if(!cleanUrls.length) return [];
-    const saved = [];
-    for(const [index, url] of cleanUrls.entries()){
-        const payload = {
-            url,
-            name:String(names[index] || fileNameFromUrl(url) || `URL ${assetUrlLibraryItems().length + index + 1}`).trim(),
-            kind:smartManualUrlKind(url, 'image')
-        };
-        const data = await fetch('/api/asset-url-library/items', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify(payload)
-        }).then(async r => {
-            if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '保存 URL 失败');
-            return r.json();
-        });
-        setAssetUrlLibraryFromResponse(data, {render:false});
-        saved.push(data.item || payload);
-    }
-    if(assetTab === 'url') renderAssetLibrary();
-    return saved;
-}
-function parseAssetUrlEditText(text, fallback={}){
-    const lines = String(text || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-    if(!lines.length) return null;
-    const firstUrlIndex = lines.findIndex(line => isRemoteVideoReferenceUrl(line));
-    const url = firstUrlIndex >= 0 ? lines[firstUrlIndex] : (fallback.url || '');
-    const name = firstUrlIndex === 0
-        ? (fallback.name || fileNameFromUrl(url) || 'URL')
-        : (lines[0] || fallback.name || fileNameFromUrl(url) || 'URL');
-    return url ? {url, name} : null;
-}
-function assetUrlLibraryControlsHtml(){
-    const count = assetUrlLibraryItems().length;
-    return `<div class="asset-url-controls">
-        <button class="asset-url-add" type="button" data-add-asset-url>
-            <i data-lucide="link"></i><span>添加 URL</span>
-        </button>
-        <button class="asset-url-add" type="button" data-upload-asset-url-images>
-            <i data-lucide="upload-cloud"></i><span>上传图片</span>
-        </button>
-        <span class="asset-url-count">${escapeHtml(count ? `${count} 个链接素材` : '保存公网图 / 视频链接')}</span>
-    </div>`;
-}
-function renderAssetUrlLibrary(){
-    const items = assetUrlLibraryItems();
-    assetGrid.innerHTML = `${assetUrlLibraryControlsHtml()}${items.length ? items.map(item => `
-        <div class="asset-item asset-url-item" draggable="true" data-asset-url-id="${escapeHtml(item.id)}" data-url="${escapeHtml(item.url)}" data-name="${escapeHtml(item.name || 'URL')}" data-kind="${escapeHtml(assetMediaKind(item))}" title="${escapeHtml(item.url)}">
-            ${assetThumbHtml(item)}
-            <div class="asset-meta">
-                <span class="asset-name">${escapeHtml(item.name || 'URL')}</span>
-                <button class="asset-mini-btn" type="button" data-copy-asset-url="${escapeHtml(item.id)}" title="复制 URL"><i data-lucide="copy"></i></button>
-                <button class="asset-mini-btn" type="button" data-refresh-asset-url="${escapeHtml(item.id)}" title="重新上传并覆盖 URL"><i data-lucide="upload-cloud"></i></button>
-                <button class="asset-mini-btn" type="button" data-edit-asset-url="${escapeHtml(item.id)}" title="${escapeHtml(tr('smart.assetRename'))}"><i data-lucide="pencil"></i></button>
-                <button class="asset-mini-btn" type="button" data-delete-asset-url="${escapeHtml(item.id)}" title="${escapeHtml(tr('common.delete'))}"><i data-lucide="trash-2"></i></button>
-            </div>
-        </div>
-    `).join('') : `<div class="asset-empty">暂无 URL 素材，添加公网图片或视频链接后会显示在这里</div>`}`;
-    bindAssetUrlLibraryEvents();
-    bindSmartPreviewImageFallbacks(assetGrid);
-    refreshIcons();
-}
-function bindAssetUrlLibraryEvents(){
-    assetGrid.querySelector('[data-add-asset-url]')?.addEventListener('click', async event => {
-        event.preventDefault();
-        event.stopPropagation();
-        const value = await openAssetNameDialog({
-            title:'添加 URL 素材',
-            value:'',
-            placeholder:'每行一个 http/https 链接或 asset:// 素材 URI',
-            cancelValue:null,
-            multiline:true
-        });
-        if(value === null) return;
-        const urls = splitManualMediaUrls(value);
-        const invalid = urls.find(url => !isRemoteVideoReferenceUrl(url));
-        if(!urls.length || invalid){
-            toast(invalid ? '请输入 http/https 媒体网址或 asset:// 火山素材 URI' : '请输入 URL');
-            return;
-        }
-        try {
-            await saveUrlsToAssetUrlLibrary(urls);
-            toast(`已保存 ${urls.length} 个 URL 素材`);
-        } catch(err){
-            toast(err.message || '保存 URL 失败');
-        }
-    });
-    assetGrid.querySelector('[data-upload-asset-url-images]')?.addEventListener('click', async event => {
-        event.preventDefault();
-        event.stopPropagation();
-        const files = await pickAssetUrlImageFiles(true);
-        if(!files.length) return;
-        const btn = event.currentTarget;
-        btn.disabled = true;
-        try {
-            await addUploadedImagesToAssetUrlLibrary(files);
-        } catch(err){
-            toast(err.message || '上传图片失败');
-        } finally {
-            btn.disabled = false;
-        }
-    });
-    assetGrid.querySelectorAll('.asset-url-item').forEach(el => {
-        const item = assetUrlLibraryItems().find(x => x.id === el.dataset.assetUrlId) || {url:el.dataset.url, name:el.dataset.name, kind:el.dataset.kind};
-        el.addEventListener('dragstart', event => {
-            event.dataTransfer.effectAllowed = 'copy';
-            event.dataTransfer.setData('application/x-smart-asset', JSON.stringify(assetNodeImageFromItem(item, 'URL')));
-            event.dataTransfer.setData('text/plain', item.url || '');
-        });
-    });
-    assetGrid.querySelectorAll('[data-copy-asset-url]').forEach(btn => {
-        btn.onclick = async event => {
-            event.preventDefault();
-            event.stopPropagation();
-            const item = assetUrlLibraryItems().find(x => x.id === btn.dataset.copyAssetUrl);
-            if(!item?.url) return;
-            await copyTextToClipboard(item.url);
-            toast('已复制 URL');
-        };
-    });
-    assetGrid.querySelectorAll('[data-edit-asset-url]').forEach(btn => {
-        btn.onclick = async event => {
-            event.preventDefault();
-            event.stopPropagation();
-            const item = assetUrlLibraryItems().find(x => x.id === btn.dataset.editAssetUrl);
-            if(!item) return;
-            const value = await openAssetNameDialog({
-                title:'编辑 URL 素材',
-                value:`${item.name || 'URL'}\n${item.url || ''}`,
-                placeholder:'第一行名称，第二行 URL',
-                cancelValue:null,
-                multiline:true
-            });
-            if(value === null) return;
-            const parsed = parseAssetUrlEditText(value, item);
-            if(!parsed || !isRemoteVideoReferenceUrl(parsed.url)){
-                toast('请输入 http/https 媒体网址或 asset:// 火山素材 URI');
-                return;
-            }
-            btn.disabled = true;
-            try {
-                const data = await fetch(`/api/asset-url-library/items/${encodeURIComponent(item.id)}`, {
-                    method:'PATCH',
-                    headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({...parsed, kind:smartManualUrlKind(parsed.url, item.kind || 'image')})
-                }).then(async r => {
-                    if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '更新 URL 失败');
-                    return r.json();
-                });
-                setAssetUrlLibraryFromResponse(data);
-            } catch(err){
-                btn.disabled = false;
-                toast(err.message || '更新 URL 失败');
-            }
-        };
-    });
-    assetGrid.querySelectorAll('[data-refresh-asset-url]').forEach(btn => {
-        btn.onclick = async event => {
-            event.preventDefault();
-            event.stopPropagation();
-            const item = assetUrlLibraryItems().find(x => x.id === btn.dataset.refreshAssetUrl);
-            if(!item) return;
-            const files = await pickAssetUrlImageFiles(false);
-            if(!files.length) return;
-            btn.disabled = true;
-            try {
-                await refreshAssetUrlItemFromImageFile(item, files[0]);
-            } catch(err){
-                toast(err.message || '覆盖 URL 失败');
-            } finally {
-                btn.disabled = false;
-            }
-        };
-    });
-    assetGrid.querySelectorAll('[data-delete-asset-url]').forEach(btn => {
-        btn.onclick = async event => {
-            event.preventDefault();
-            event.stopPropagation();
-            btn.disabled = true;
-            try {
-                const data = await fetch(`/api/asset-url-library/items/${encodeURIComponent(btn.dataset.deleteAssetUrl)}`, {method:'DELETE'}).then(async r => {
-                    if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '删除 URL 失败');
-                    return r.json();
-                });
-                setAssetUrlLibraryFromResponse(data);
-            } catch(err){
-                btn.disabled = false;
-                toast(err.message || '删除 URL 失败');
-            }
-        };
-    });
-}
-function isAssetUrlImageUploadFile(file){
-    const type = String(file?.type || '').toLowerCase();
-    const name = String(file?.name || '').toLowerCase();
-    return type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|tiff|avif)(\?|$)/.test(name);
-}
-function pickAssetUrlImageFiles(multiple=true){
-    return new Promise(resolve => {
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = 'image/*';
-        input.multiple = Boolean(multiple);
-        input.style.display = 'none';
-        input.onchange = () => {
-            const files = [...(input.files || [])].filter(isAssetUrlImageUploadFile);
-            input.remove();
-            resolve(files);
-        };
-        input.oncancel = () => {
-            input.remove();
-            resolve([]);
-        };
-        document.body.appendChild(input);
-        input.click();
-    });
-}
-async function uploadAssetUrlImageFilesToLocal(files=[]){
-    const clean = [...(files || [])].filter(isAssetUrlImageUploadFile);
-    if(!clean.length) return [];
-    const form = new FormData();
-    form.append('folder', 'url-library');
-    clean.forEach(file => form.append('files', file, file.name || 'image'));
-    const data = await fetch('/api/local-assets/upload', {method:'POST', body:form}).then(async r => {
-        if(!r.ok) throw new Error(await smartResponseErrorMessage(r, '本地保存图片失败'));
-        return r.json();
-    });
-    return Array.isArray(data.files) ? data.files : [];
-}
-async function uploadLocalAssetItemToCloud(item){
-    const localUrl = item?.url || '';
-    if(!localUrl) throw new Error('本地图片保存失败，没有得到文件地址');
-    const response = await fetch('/api/cloud-video/upload', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({url:localUrl, service:'auto'})
-    });
-    if(!response.ok) throw new Error(await smartResponseErrorMessage(response, '云端上传失败'));
-    const data = await response.json();
-    const url = data.url || '';
-    if(!url) throw new Error('云端上传没有返回 URL');
-    return {
-        url,
-        name:item.name || fileNameFromUrl(localUrl) || fileNameFromUrl(url) || 'image',
-        sourceUrl:localUrl,
-        expires:data.expires || '',
-        service:data.service || ''
-    };
-}
-async function uploadImageFilesToCloudUrlItems(files=[]){
-    const localItems = await uploadAssetUrlImageFilesToLocal(files);
-    const uploaded = [];
-    for(const [index, item] of localItems.entries()){
-        toast(`正在上传云端 ${index + 1}/${localItems.length}...`);
-        uploaded.push(await uploadLocalAssetItemToCloud(item));
-    }
-    return uploaded;
-}
-async function addUploadedImagesToAssetUrlLibrary(files=[]){
-    const uploaded = await uploadImageFilesToCloudUrlItems(files);
-    if(!uploaded.length){
-        toast('没有可上传的图片');
-        return [];
-    }
-    await saveUrlsToAssetUrlLibrary(
-        uploaded.map(item => item.url),
-        uploaded.map(item => item.name)
-    );
-    toast(`已上传并保存 ${uploaded.length} 个 URL 素材`);
-    return uploaded;
-}
-async function refreshAssetUrlItemFromImageFile(item, file){
-    const uploaded = await uploadImageFilesToCloudUrlItems([file]);
-    const next = uploaded[0];
-    if(!next?.url) throw new Error('云端上传没有返回 URL');
-    const data = await fetch(`/api/asset-url-library/items/${encodeURIComponent(item.id)}`, {
-        method:'PATCH',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({
-            url:next.url,
-            name:item.name || next.name,
-            kind:'image',
-            note:item.note || ''
-        })
-    }).then(async r => {
-        if(!r.ok) throw new Error(await smartResponseErrorMessage(r, '覆盖 URL 失败'));
-        return r.json();
-    });
-    setAssetUrlLibraryFromResponse(data);
-    toast('已重新上传并覆盖 URL');
-    return next;
-}
-async function addMediaItemsToAssetUrlLibrary(items=[]){
-    const list = (items || []).filter(item => item?.url);
-    if(!list.length){
-        toast('没有可上传的图片');
-        return [];
-    }
-    const uploaded = [];
-    for(const [index, item] of list.entries()){
-        toast(`正在上传云端 ${index + 1}/${list.length}...`);
-        const next = await uploadLocalAssetItemToCloud(item);
-        uploaded.push({
-            ...next,
-            name:item.name || next.name || smartImageNameFromUrl(next.url)
-        });
-    }
-    await saveUrlsToAssetUrlLibrary(
-        uploaded.map(item => item.url),
-        uploaded.map(item => item.name)
-    );
-    toast(`已上传并保存 ${uploaded.length} 个 URL 素材`);
-    return uploaded;
 }
 function openAssetNameDialog({title='', value='', placeholder='', cancelValue='', multiline=false }={}){
     if(!assetDialogBackdrop || !assetDialogInput || !assetDialogOk || !assetDialogCancel) return Promise.resolve(cancelValue);
@@ -6311,11 +5804,6 @@ async function loadCanvas(){
         canvasUsesConnections = Object.prototype.hasOwnProperty.call(canvas || {}, 'connections');
         document.title = canvas.title || tr('canvas.smartCanvas');
         document.getElementById('smartTitle').textContent = canvas.title || tr('canvas.smartCanvas');
-        localDeletedNodeIds.clear();
-        (canvas.deleted_node_ids || []).forEach(id => {
-            const value = String(id || '').trim();
-            if(value) localDeletedNodeIds.add(value);
-        });
         nodes = (Array.isArray(canvas.nodes) ? canvas.nodes : []).map(normalizeLegacySmartNode).filter(Boolean);
         migrateSmartGroupImageMembers();
         canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
@@ -6382,23 +5870,13 @@ async function saveCanvas(){
                 viewport:storageCanvas.viewport || {x:0,y:0,scale:1},
                 logs:storageCanvas.logs || [],
                 settings:storageCanvas.settings,
-                deleted_node_ids:storageCanvas.deleted_node_ids || [],
                 base_updated_at:storageCanvas.updated_at || canvas.updated_at || 0,
                 client_id:smartClientId
             })
         });
         if(res.ok){
             const data = await res.json();
-            if(data.canvas){
-                if(data.canvas.updated_at) canvas.updated_at = data.canvas.updated_at;
-                (data.canvas.deleted_node_ids || []).forEach(id => {
-                    const value = String(id || '').trim();
-                    if(value) localDeletedNodeIds.add(value);
-                });
-                (data.canvas.nodes || []).forEach(node => {
-                    if(node?.id) localUnsyncedNodeIds.delete(node.id);
-                });
-            }
+            if(data.canvas && data.canvas.updated_at) canvas.updated_at = data.canvas.updated_at;
         } else if(res.status === 409) {
             // 冲突：别人先保存了。合并对方的状态（节点 id 合并、图片取并集，谁都不丢），
             // 然后用对方最新的 updated_at 作为基底重存，把合并结果落盘——而不是直接覆盖对方。
@@ -6438,8 +5916,6 @@ function createNode(x, y, images=[], options={}){
     node.scale = nodeImages.length > 1 ? MEDIA_GROUP_DEFAULT_SCALE : mediaNodeDefaultScale(node);
     inheritNodeMetaFromImage(node);
     nodes.push(node);
-    localUnsyncedNodeIds.add(node.id);
-    localDeletedNodeIds.delete(node.id);
     if(options.select !== false) selectedId = node.id;
     render();
     scheduleSave();
@@ -6467,8 +5943,6 @@ function createPromptNode(x, y, options={}){
         llmInstruction:'',
         created_at:Date.now()
     };
-    localUnsyncedNodeIds.add(node.id);
-    localDeletedNodeIds.delete(node.id);
     nodes.push(node);
     if(options.select !== false) selectedId = node.id;
     render();
@@ -6758,7 +6232,7 @@ function moveNodeElementsDuringDrag(){
         }
     });
     const active = selectedNode();
-    if(active && !document.body.classList.contains('smart-canvas-interacting') && (dragState.group || [{id:dragState.id}]).some(item => item.id === active.id)){
+    if(active && (dragState.group || [{id:dragState.id}]).some(item => item.id === active.id)){
         positionComposerForNode(active);
     }
     scheduleInteractionLayerRefresh();
@@ -6822,7 +6296,7 @@ function updateNodeElementDuringResize(node){
         }
     }
     const active = selectedNode();
-    if(active?.id === node.id && !document.body.classList.contains('smart-canvas-interacting')) positionComposerForNode(active);
+    if(active?.id === node.id) positionComposerForNode(active);
     scheduleInteractionLayerRefresh();
 }
 function syncSmartGroupMemberElements(group){
@@ -7422,46 +6896,6 @@ function openSmartLogLightbox(url, kind='image'){
 function smartLogPreviewNode(url, kind='image'){
     openSmartLogLightbox(url, kind);
 }
-async function deleteCanvasLogEntry(logId, deleteMedia=false){
-    if(!canvas || !canvasId || !logId) return;
-    const confirmText = deleteMedia ? tr('canvas.deleteLogMediaConfirm') : tr('canvas.deleteLogConfirm');
-    if(!confirm(confirmText)) return;
-    try {
-        if(saveTimer){
-            clearTimeout(saveTimer);
-            saveTimer = null;
-            await saveCanvas();
-        }
-        const res = await fetch(`/api/canvases/${encodeURIComponent(canvasId)}/logs/delete`, {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({
-                log_id:logId,
-                delete_unreferenced_media:deleteMedia,
-                reset_referencing_nodes:deleteMedia,
-                base_updated_at:Number(canvas.updated_at || 0)
-            })
-        });
-        const data = await res.json().catch(() => ({}));
-        if(!res.ok) throw new Error(data.detail || tr('canvas.logDeleteFailed'));
-        canvas.logs = data.canvas?.logs || (canvas.logs || []).filter(item => item.id !== logId);
-        if(data.canvas?.nodes){
-            canvas.nodes = data.canvas.nodes;
-            canvas.connections = data.canvas.connections || [];
-            nodes = canvas.nodes;
-            render();
-        }
-        canvas.updated_at = Number(data.canvas?.updated_at || canvas.updated_at || Date.now());
-        renderSmartCanvasLog();
-        const notes = [tr('canvas.logDeleted')];
-        if(data.removed_files?.length) notes.push(tr('canvas.logMediaRemoved').replace('{n}', data.removed_files.length));
-        if(data.reset_node_ids?.length) notes.push(tr('canvas.logNodesReset').replace('{n}', data.reset_node_ids.length));
-        if(data.skipped_referenced?.length) notes.push(tr('canvas.logMediaReferenced').replace('{n}', data.skipped_referenced.length));
-        toast(notes.join(' · '));
-    } catch(err) {
-        toast(err?.message || tr('canvas.logDeleteFailed'));
-    }
-}
 function renderSmartCanvasLog(){
     const logs = canvas?.logs || [];
     smartLogList.innerHTML = logs.length ? logs.map(log => {
@@ -7485,7 +6919,7 @@ function renderSmartCanvasLog(){
             taskId ? `ID ${taskId}` : '',
             backend
         ].filter(Boolean);
-        return `<div class="log-item ${log.status === 'failed' ? 'failed' : ''}" data-canvas-log-id="${escapeAttr(log.id || '')}">
+        return `<div class="log-item ${log.status === 'failed' ? 'failed' : ''}">
             <div class="log-main">
                 <div class="log-meta">
                     <span class="log-chip ${log.status === 'failed' ? 'status-failed' : 'status-ok'}">${escapeHtml(log.status === 'failed' ? tr('canvas.failed') : tr('canvas.success'))}</span>
@@ -7496,10 +6930,6 @@ function renderSmartCanvasLog(){
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
                 ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
-                <div class="log-actions">
-                    <button type="button" data-log-delete="record"><i data-lucide="list-x"></i><span>${escapeHtml(tr('canvas.deleteLog'))}</span></button>
-                    <button type="button" class="danger" data-log-delete="media"><i data-lucide="trash-2"></i><span>${escapeHtml(tr('canvas.deleteLogAndMedia'))}</span></button>
-                </div>
             </div>
             <div class="log-thumbs">${thumbs}</div>
         </div>`;
@@ -7529,13 +6959,6 @@ function renderSmartCanvasLog(){
     };
     bindLogCopy('[data-prompt]', 'prompt');
     bindLogCopy('[data-error]', 'error');
-    smartLogList.querySelectorAll('[data-log-delete]').forEach(button => {
-        button.onclick = e => {
-            e.stopPropagation();
-            const logId = button.closest('[data-canvas-log-id]')?.dataset.canvasLogId || '';
-            deleteCanvasLogEntry(logId, button.dataset.logDelete === 'media');
-        };
-    });
     refreshIcons();
 }
 function openSmartCanvasLog(){
@@ -7930,41 +7353,31 @@ function runSmartNodeToolbarAction(nodeId, action){
         setGridOperationMode('join');
     }
 }
-// 对选中图片单独执行即梦 image_upscale：新建一个占位节点承接放大结果，复用画布任务队列 + 排队续查逻辑。
 async function runJimengUpscale(node, index){
     node = liveSmartNode(node) || node;
-    if(!node) return;
-    const item = imageForDisplay(node.images?.[index]);
+    const item = imageForDisplay(node?.images?.[index]);
     if(!item?.url || mediaKindForItem(item) !== 'image'){ toast(tr('smart.jimengUpscaleNeedImage')); return; }
     const providerId = jimengImageProviderId();
     if(!providerId){ toast(tr('smart.jimengUpscaleNeedImage')); return; }
     const resolution = JIMENG_UPSCALE_RESOLUTIONS.includes(settings.jimengUpscaleRes) ? settings.jimengUpscaleRes : '2k';
     pushUndo();
     const rect = nodeRect(node);
-    const point = {x:rect.x + rect.width + 220, y:rect.y + rect.height / 2};
-    const newNode = createImageNodeAt(point, [], {select:true, skipUndo:true});
-    newNode.title = 'Upscale';
-    newNode.runStartedAt = nowMs();
-    delete newNode.runFinishedAt;
-    newNode.pending = 1;
-    newNode.running = true;
+    const target = createImageNodeAt({x:rect.x + rect.width + 220, y:rect.y + rect.height / 2}, [], {select:true, skipUndo:true});
+    target.title = 'Upscale';
+    target.runStartedAt = nowMs();
+    target.pending = 1;
+    target.running = true;
     render();
     try {
-        const payload = {
-            prompt:`upscale ${resolution}`,
-            provider_id:providerId,
-            model:'',
-            operation:'upscale',
-            resolution_type:resolution,
-            n:1,
-            reference_images:[{url:item.url, name:item.name || 'upscale-input.png'}]
-        };
-        const task = await fetch('/api/canvas-image-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(async r => {
-            if(!r.ok) throw new Error(await r.text());
-            return r.json();
+        const task = await fetch('/api/canvas-image-tasks', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({prompt:`upscale ${resolution}`, provider_id:providerId, model:'', operation:'upscale', resolution_type:resolution, n:1, reference_images:[{url:item.url, name:item.name || 'upscale-input.png'}]})
+        }).then(async response => {
+            if(!response.ok) throw new Error(await response.text());
+            return response.json();
         });
         if(!task.task_id) throw new Error(tr('smart.errRunFailed'));
-        const live = liveSmartNode(newNode) || newNode;
+        const live = liveSmartNode(target) || target;
         live.pendingTasks = [{taskId:task.task_id, kind:'image', providerId, model:''}];
         live.pending = 1;
         live.running = false;
@@ -7972,15 +7385,13 @@ async function runJimengUpscale(node, index){
         scheduleSave();
         await saveCanvas();
         await resumeSmartPendingNode(live);
-    } catch(e){
-        toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
-        const live = liveSmartNode(newNode) || newNode;
+    } catch(error) {
+        toast((error.message || tr('smart.errRunFailed')).slice(0, 160));
+        const live = liveSmartNode(target) || target;
         live.running = false;
         live.pending = 0;
         delete live.pendingTasks;
-        if(!(live.images || []).length && !live.jimengPending){
-            nodes = nodes.filter(n => n.id !== live.id);
-        }
+        if(!(live.images || []).length && !live.jimengPending) nodes = nodes.filter(item => item.id !== live.id);
         render();
         scheduleSave();
     }
@@ -8171,7 +7582,9 @@ function render(){
     updateComposer();
     renderMinimap();
     if(window.lucide) lucide.createIcons();
-    scheduleSmartPostRenderMediaWork();
+    bindSmartPreviewImageFallbacks(world);
+    syncSmartSelectedImageResolution(world);
+    measureSmartNodeImages();
     refreshRunTimerPills();
     return;
     world.innerHTML = '';
@@ -8748,14 +8161,18 @@ function bindNodeEvents(){
             e.stopPropagation();
             if(Date.now() < suppressNodeClickUntil) return;
             const node = nodes.find(n => n.id === id);
-            const timerHidden = hideRunTimerForNode(node);
+            hideRunTimerForNode(node);
+            const alreadySelected = selectedId === id && selectedIds.length === 0 && selectedImage.nodeId === '';
             selectedId = id;
             selectedIds = [];
             selectedImage = {nodeId:'', index:-1};
             if(smartCascadeAnyRunning()) smartCascadeSilentSelection = false;
-            syncSelectionUi();
-            if(timerHidden) refreshRunTimerPills();
-            updateComposer();
+            if(alreadySelected){
+                syncSelectionUi();
+                updateComposer();
+                return;
+            }
+            render();
         };
         if(nodeForControls?.type !== 'smart-group') el.ondblclick = e => e.stopPropagation();
         const nodeDrop = el.querySelector('.node-drop');
@@ -8999,7 +8416,7 @@ function bindNodeEvents(){
                 resizeState.contentFitW = hasM ? Math.max(1, maxR - gx0 + 16) : (rect.width || 1);
                 resizeState.contentFitH = hasM ? Math.max(1, maxB - gy0 + 16) : (rect.height || 1);
             }
-            document.body.classList.add('smart-node-resize', 'smart-canvas-interacting');
+            document.body.classList.add('smart-node-resize');
             capturePendingUndo();
         });
         const beginNodeDrag = e => {
@@ -9021,7 +8438,7 @@ function bindNodeEvents(){
                 return n ? {id:n.id, ox:Number(n.x) || 0, oy:Number(n.y) || 0} : null;
             }).filter(Boolean);
             dragState = {id:node.id, startX:e.clientX, startY:e.clientY, ox:node.x || 0, oy:node.y || 0, group, groupIds:group.map(item => item.id), ctrlGroup:Boolean(e.ctrlKey)};
-            document.body.classList.add('smart-node-drag', 'smart-canvas-interacting');
+            document.body.classList.add('smart-node-drag');
             capturePendingUndo();
         };
         el.querySelectorAll('.node-port').forEach(port => {
@@ -9121,12 +8538,6 @@ function deleteNode(id){
     const deleteIds = new Set([id]);
     nodes.forEach(node => {
         if(isHistoryGroupNode(node) && node.historyFor === id) deleteIds.add(node.id);
-    });
-    deleteIds.forEach(nodeId => {
-        if(nodeId){
-            localDeletedNodeIds.add(nodeId);
-            localUnsyncedNodeIds.delete(nodeId);
-        }
     });
     nodes = nodes.filter(node => !deleteIds.has(node.id));
     if(canvas) canvas.connections = (canvas.connections || []).filter(c => !deleteIds.has(c.from) && !deleteIds.has(c.to));
@@ -12146,11 +11557,9 @@ function renderInputThumbsRow(node){
     inputThumbsRow.classList.toggle('has-items', Boolean(node));
     if(!node){ inputThumbsRow.innerHTML = ''; return; }
     const addButton = `<button class="input-thumb-add ${addActive ? 'active' : ''}" type="button" data-input-add-reference title="${escapeHtml(addActive ? '收起参考图' : '添加参考图')}" aria-label="${escapeHtml(addActive ? '收起参考图' : '添加参考图')}"><i data-lucide="image-plus"></i></button>`;
-    const utilityButtons = `${renderTempShUploadControl()}${renderManualVideoUrlControl()}`;
     if(!dedup.length){
-        inputThumbsRow.innerHTML = `<div class="input-thumb-list empty"></div><div class="input-thumb-actions">${utilityButtons}${addButton}</div>`;
+        inputThumbsRow.innerHTML = `<div class="input-thumb-list empty"></div><div class="input-thumb-actions">${addButton}</div>`;
         bindInputThumbReferenceActions();
-        bindInputThumbVideoActions();
         refreshIcons();
         return;
     }
@@ -12175,11 +11584,10 @@ function renderInputThumbsRow(node){
         const removeBtn = removable ? `<button class="input-thumb-remove" type="button" data-input-remove-reference="${escapeHtml(inputRefKey(img))}" title="删除参考图" aria-label="删除参考图">×</button>` : '';
         return `<div class="input-thumb ${isSelf ? 'input-self' : ''} ${removable ? 'input-manual-ref' : ''}" draggable="false" data-thumb-index="${i}" data-node-id="${escapeHtml(img.nodeId || '')}" data-image-index="${img.imageIndex ?? ''}" data-url="${escapeHtml(img.url || '')}" data-source-url="${escapeHtml(sourceUrl)}" title="${escapeHtml(`${img.name || tr('smart.inputNum').replace('{n}', String(i + 1))} · ${title}`)}">${inner}<span class="input-thumb-label">${escapeHtml(label)}</span>${removeBtn}</div>`;
     }).join('');
-    inputThumbsRow.innerHTML = `<div class="input-thumb-list">${thumbsHtml}${dedup.length > 1 ? `<span class="input-thumb-count">${escapeHtml(tr('smart.inputCount').replace('{n}', String(dedup.length)))}</span>` : ''}</div><div class="input-thumb-actions">${utilityButtons}${addButton}</div>`;
+    inputThumbsRow.innerHTML = `<div class="input-thumb-list">${thumbsHtml}${dedup.length > 1 ? `<span class="input-thumb-count">${escapeHtml(tr('smart.inputCount').replace('{n}', String(dedup.length)))}</span>` : ''}</div><div class="input-thumb-actions">${addButton}</div>`;
     bindSmartPreviewImageFallbacks(inputThumbsRow);
     bindInputThumbsDrag(node, dedup, manualRefKeys);
     bindInputThumbReferenceActions();
-    bindInputThumbVideoActions();
     refreshIcons();
 }
 function bindInputThumbReferenceActions(){
@@ -13169,7 +12577,6 @@ function rememberRoundOutputs(ctx, node, outputs){
 }
 function inputRefKey(img){
     if(!img?.url) return '';
-    if(img.mediaInstanceId) return `manual|${img.mediaInstanceId}`;
     const nodeId = img.nodeId || '';
     const imageIndex = Number.isFinite(Number(img.imageIndex)) ? String(Number(img.imageIndex)) : '';
     if(nodeId && imageIndex !== '') return `${nodeId}|${imageIndex}`;
@@ -13182,7 +12589,6 @@ function manualReferenceImagesFor(node){
     if(!node || !Array.isArray(node.manualInputRefs)) return [];
     return node.manualInputRefs.filter(img => img?.url).map((img, index) => ({
         ...img,
-        mediaInstanceId:img.mediaInstanceId || img.instanceId || '',
         kind:img.kind || mediaKindForItem(img),
         name:img.name || `图${index + 1}`,
         imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index,
@@ -13287,9 +12693,8 @@ function uniqueReferenceImages(images){
     const refs = [];
     const seen = new Set();
     (images || []).forEach((img, index) => {
-        const key = inputRefKey(img) || `url|${img?.url || ''}`;
-        if(!img?.url || seen.has(key)) return;
-        seen.add(key);
+        if(!img?.url || seen.has(img.url)) return;
+        seen.add(img.url);
         if(refs.length >= SMART_REFERENCE_IMAGE_MAX) return;
         refs.push({
             ...img,
@@ -13308,9 +12713,8 @@ function inputMentionCandidateImages(node){
     const current = node ? [...lineImagesFor(node), ...manualReferenceImagesFor(node)] : [];
     const seen = new Set();
     return current.filter(img => {
-        const key = inputRefKey(img) || `url|${img?.url || ''}`;
-        if(!img?.url || seen.has(key)) return false;
-        seen.add(key);
+        if(!img?.url || seen.has(img.url)) return false;
+        seen.add(img.url);
         return true;
     }).map((img, index) => ({
         ...img,
@@ -13328,31 +12732,14 @@ function assetRegisteredUris(item){
     });
     return out;
 }
-function assetUrlMentionCandidateImages(){
-    return assetUrlLibraryItems().map((item, index) => ({
-        url:item.url,
-        kind:assetMediaKind(item),
-        name:item.name || `URL ${index + 1}`,
-        alias:item.name || `URL ${index + 1}`,
-        role:'url-asset',
-        categoryName:'URL',
-        asset_uris:{},
-        mentionId:`asset_url_${index}_${Math.random().toString(36).slice(2, 7)}`
-    }));
-}
 function assetMentionCandidateImages(categoryId=''){
     const cats = assetCategories('image');
     const cat = cats.find(c => c.id === categoryId) || assetCategoryForMention();
-    const urlItems = assetUrlMentionCandidateImages();
-    if(cat) mentionAssetCategoryId = cat.id;
-    const items = cat ? (cat.items || []).map(item => ({...item, categoryName:cat.name || '', categoryId:cat.id})) : [];
+    if(!cat) return [];
+    mentionAssetCategoryId = cat.id;
+    const items = (cat.items || []).map(item => ({...item, categoryName:cat.name || '', categoryId:cat.id}));
     const seen = new Set();
-    const extraUrlItems = urlItems.filter(item => {
-        if(!item?.url || seen.has(item.url)) return false;
-        seen.add(item.url);
-        return true;
-    });
-    const normalItems = items.filter(item => {
+    return items.filter(item => {
         if(!item?.url || seen.has(item.url)) return false;
         seen.add(item.url);
         return true;
@@ -13366,7 +12753,6 @@ function assetMentionCandidateImages(categoryId=''){
         asset_uris:assetRegisteredUris(item),
         mentionId:`asset_${index}_${Math.random().toString(36).slice(2, 7)}`
     }));
-    return [...extraUrlItems, ...normalItems];
 }
 function mentionCandidateImages(node, source=mentionSource){
     return source === 'asset' ? assetMentionCandidateImages(mentionAssetCategoryId) : inputMentionCandidateImages(node);
@@ -13402,9 +12788,8 @@ function renderMentionPicker(source){
     if(!activeAssetLibraryId || !assetLibs.some(lib => lib.id === activeAssetLibraryId)) activeAssetLibraryId = assetLibrary.active_library_id || assetLibs[0]?.id || '';
     const libraryWithMentionAssets = assetLibs.find(lib => (lib.categories || []).some(cat => (cat.type || 'image') === 'image' && (cat.items || []).some(item => item?.url)));
     const assetCats = assetCategories('image');
-    const hasUrlAssets = assetUrlLibraryItems().length > 0;
     const hasInput = inputItems.length > 0;
-    const hasAssets = Boolean(libraryWithMentionAssets) || hasUrlAssets;
+    const hasAssets = Boolean(libraryWithMentionAssets);
     mentionSource = source || (hasInput ? 'input' : 'asset');
     if(mentionSource === 'asset' && hasAssets && !assetCats.some(cat => (cat.items || []).some(item => item?.url)) && libraryWithMentionAssets){
         activeAssetLibraryId = libraryWithMentionAssets.id;
@@ -13528,45 +12913,39 @@ function toggleAssetMentionPickerFromThumbs(){
     mentionAnchorEl = inputThumbsRow?.querySelector('[data-input-add-reference]') || inputThumbsRow;
     renderMentionPicker('asset');
 }
-function manualReferenceFromMediaItem(img){
+function addManualReferenceToSelectedNode(img){
+    const node = selectedNode();
+    if(!node || !img?.url) return;
     const kind = img.kind || mediaKindForItem(img);
     const ref = {
         url:img.url,
         name:img.alias || img.name || (kind === 'audio' ? '音频' : kind === 'video' ? '视频' : '图片'),
         kind,
-        mediaInstanceId:img.mediaInstanceId || uid('manual_url'),
         nodeId:img.nodeId || '',
         imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : '',
         asset_uris:img.asset_uris || {},
         manualAdded:true
     };
     if(img.originalLocalUrl) ref.originalLocalUrl = img.originalLocalUrl;
-    return ref;
-}
-function addManualReferenceToNode(node, img, options={}){
-    if(!node || !img?.url) return;
-    const ref = manualReferenceFromMediaItem(img);
     const refs = Array.isArray(node.manualInputRefs) ? node.manualInputRefs.slice() : [];
     const key = inputRefKey(ref);
-    if(options.allowDuplicate === false && refs.some(item => inputRefKey(item) === key)){
-        if(options.closePicker !== false) closeMentionPicker();
+    const exists = refs.some(item => inputRefKey(item) === key || item.url === ref.url);
+    if(exists){
+        closeMentionPicker();
         return;
     }
-    if(options.undo !== false) pushUndo();
+    pushUndo();
     refs.push(ref);
     node.manualInputRefs = refs;
-    if(options.closePicker !== false) closeMentionPicker();
-    if(options.render !== false) renderInputThumbsRow(node);
-    if(options.save !== false) scheduleSave();
-}
-function addManualReferenceToSelectedNode(img){
-    addManualReferenceToNode(selectedNode(), img);
+    closeMentionPicker();
+    renderInputThumbsRow(node);
+    scheduleSave();
 }
 function removeManualReferenceFromSelectedNode(key){
     const node = selectedNode();
     if(!node || !key || !Array.isArray(node.manualInputRefs)) return;
     const refs = node.manualInputRefs.slice();
-    const index = refs.findIndex(ref => inputRefKey(ref) === key);
+    const index = refs.findIndex(ref => inputRefKey(ref) === key || ref?.url === key.replace(/^url\|/, ''));
     if(index < 0) return;
     pushUndo();
     refs.splice(index, 1);
@@ -13662,7 +13041,6 @@ function insertMentionToken(img){
     token.dataset.url = img.url;
     token.dataset.kind = mediaKindForItem(img);
     token.dataset.name = img.alias || img.name || (token.dataset.kind === 'audio' ? '音频' : token.dataset.kind === 'video' ? '视频' : '图片');
-    token.dataset.mediaInstanceId = img.mediaInstanceId || '';
     token.dataset.nodeId = img.nodeId || '';
     token.dataset.imageIndex = String(img.imageIndex ?? '');
     token.dataset.assetUris = JSON.stringify(img.asset_uris || {});
@@ -13691,7 +13069,7 @@ function collectPromptParts(){
             let assetUris = {};
             try { assetUris = JSON.parse(node.dataset.assetUris || '{}') || {}; } catch(e) { assetUris = {}; }
             const kind = node.dataset.kind || 'image';
-            parts.push({type:'image', kind, url:node.dataset.url || '', name:node.dataset.name || (kind === 'audio' ? '音频' : '图片'), mediaInstanceId:node.dataset.mediaInstanceId || '', nodeId:node.dataset.nodeId || '', imageIndex:Number(node.dataset.imageIndex || 0), asset_uris:assetUris});
+            parts.push({type:'image', kind, url:node.dataset.url || '', name:node.dataset.name || (kind === 'audio' ? '音频' : '图片'), nodeId:node.dataset.nodeId || '', imageIndex:Number(node.dataset.imageIndex || 0), asset_uris:assetUris});
             return;
         }
         if(node.tagName === 'BR'){
@@ -13729,7 +13107,7 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
     const refs = defaultRefs.map((img, index) => ({...img, role:`image_${index + 1}`}));
     let hasMentionToken = false;
     const refMap = new Map();
-    refs.forEach((img, index) => refMap.set(inputRefKey(img) || `url|${img.url}`, index + 1));
+    refs.forEach((img, index) => refMap.set(img.url, index + 1));
     let body = '';
     parts.forEach(part => {
         if(part.type === 'text'){
@@ -13743,16 +13121,15 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
             body += `@${part.name || '图片'}`;
             return;
         }
-        const partKey = inputRefKey(part) || `url|${part.url}`;
-        if(!refMap.has(partKey)){
+        if(!refMap.has(part.url)){
             if(refs.length >= SMART_REFERENCE_IMAGE_MAX){
                 body += `@${part.name || '图片'}`;
                 return;
             }
-            refMap.set(partKey, refs.length + 1);
-            refs.push({url:part.url, name:part.name || `图${refs.length + 1}`, mediaInstanceId:part.mediaInstanceId || '', nodeId:part.nodeId, imageIndex:part.imageIndex, kind:part.kind || 'image', asset_uris:part.asset_uris || {}, role:`image_${refs.length + 1}`});
+            refMap.set(part.url, refs.length + 1);
+            refs.push({url:part.url, name:part.name || `图${refs.length + 1}`, nodeId:part.nodeId, imageIndex:part.imageIndex, kind:part.kind || 'image', asset_uris:part.asset_uris || {}, role:`image_${refs.length + 1}`});
         }
-        body += `图${refMap.get(partKey)}`;
+        body += `图${refMap.get(part.url)}`;
     });
     body = body.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     const groupPrompt = isSmartGroupNode(node) ? textForNode(node, ctx).trim() : '';
@@ -13767,14 +13144,14 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
         return {
             prompt:`${tr('smart.refMapHeader')}\n${mapText}\n\n${tr('smart.refUserNeed')}\n${body}`,
             displayPrompt,
-            refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+            refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
             mentioned:true
         };
     }
     return {
         prompt:body,
         displayPrompt,
-        refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+        refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
         mentioned:false
     };
 }
@@ -14625,11 +14002,7 @@ async function generateComfyUrlsWithSettings(runSettings, prompt, refs){
         if(!imageRefs.length) throw new Error(tr('smart.errEnhanceNeedRefs'));
         const inputName = await comfyNameForRef(imageRefs[0]);
         const data = await runQueuedSmartComfyGenerate({workflow_json:'Z-Image-Enhance.json', type:'enhance', params:{"15":{image:inputName},"204":{value:Number(runSettings.enhanceStrength ?? 0.5)}}, client_id:smartClientId});
-        let urls = resultMediaUrls(data);
-        if(runSettings.enhanceUpscale && urls[0]){
-            const upscale = await runSmartComfyUpscale(urls[0], runSettings.enhanceUpscaleRes || 2048);
-            urls = resultMediaUrls(upscale);
-        }
+        const urls = resultMediaUrls(data);
         return {urls, kind:mediaKindForUrls(urls, 'image')};
     }
     if(mode === 'edit'){
@@ -14637,11 +14010,7 @@ async function generateComfyUrlsWithSettings(runSettings, prompt, refs){
         const names = [];
         for(const ref of imageRefs.slice(0, 3)) names.push(await comfyNameForRef(ref));
         const data = await runQueuedSmartComfyGenerate({prompt, workflow_json:'Flux2-Klein.json', type:'klein', params:{"168":{text:prompt},"158":{noise_seed:Math.floor(Math.random()*1000000)},"278":{image:names[0] || ""},"270":{image:names[1] || ""},"292":{image:names[2] || ""},"313":{value:Boolean(names[1])},"314":{value:Boolean(names[2])}}, client_id:smartClientId});
-        let urls = resultMediaUrls(data);
-        if(runSettings.editUpscale && urls[0]){
-            const upscale = await runSmartComfyUpscale(urls[0], runSettings.editUpscaleRes || 2048);
-            urls = resultMediaUrls(upscale);
-        }
+        const urls = resultMediaUrls(data);
         return {urls, kind:mediaKindForUrls(urls, 'image')};
     }
     const workflowName = runSettings.comfyWorkflow || comfyWorkflows[0]?.name || '';
@@ -15406,7 +14775,7 @@ function comfyFieldKind(field){
 async function runApiGeneration(prompt, refs, runSettings=settings){
     if(!runSettings.provider_id || !runSettings.model) throw new Error(tr('smart.errNoApiModel'));
     const count = Math.max(1, Math.min(8, Number(runSettings.count || 1)));
-    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:runSettings.ratio === 'custom' ? (runSettings.customRatio || '') : (runSettings.ratio || ''), resolution:runSettings.resolution || '', quality:runSettings.quality || 'auto', n:1, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX)};
+    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), quality:runSettings.quality || 'auto', n:1, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX)};
     const tasks = await Promise.all(Array.from({length:count}, () => fetch('/api/canvas-image-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(async r => {
         if(!r.ok) throw new Error(await r.text());
         return r.json();
@@ -15475,9 +14844,7 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
             return ref?.url;
         };
         const refImages = imageRefsOnly(uploadedRefs).map((ref, i) => {
-            const effectiveUrl = effUrl(ref);
-            const originalUrl = ref.originalLocalUrl || ref.sourceUrl || ref.url || '';
-            const item = {url:effectiveUrl, name:ref.name || `图${i + 1}`, originalLocalUrl:originalUrl, source_url:originalUrl};
+            const item = {url:effUrl(ref), name:ref.name || `图${i + 1}`};
             if(runSettings.videoUseFrameRoles){
                 if(i === 0) item.role = 'first_frame';
                 else if(i === 1) item.role = 'last_frame';
@@ -15486,21 +14853,7 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
         });
         const manualVideo = manualSmartVideoLink(runSettings)?.url || '';
         const refVideos = manualVideo ? manualSmartMediaLinks(runSettings).map(item => item.url).filter(Boolean) : videoRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean);
-        let refAudios = audioRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean).slice(0, 3);
-        // 即梦全能参考要求音频 2–15s：提交前探测时长，超范围的给出提示并忽略（探测失败则放行，交后端/CLI）。
-        if(refAudios.length && isJimengProviderId(runSettings.videoProvider)){
-            const kept = [];
-            for(const audioUrl of refAudios){
-                const dur = await probeMediaDuration(audioUrl, 'audio');
-                if(dur == null){ kept.push(audioUrl); continue; }
-                if(dur < 2 || dur > 15){
-                    toast(tr('smart.audioDurationRange').replace('{sec}', dur.toFixed(1)));
-                    continue;
-                }
-                kept.push(audioUrl);
-            }
-            refAudios = kept;
-        }
+        const refAudios = audioRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean).slice(0, 3);
         if(mismatchedAsset) toast('部分认证素材属于其它平台，已回退为普通素材。切换到对应平台的视频接口才能用 asset:// 认证地址。');
         const payload = {
             prompt,
@@ -15573,36 +14926,6 @@ async function urlToBase64(url){
     });
 }
 function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
-// 探测媒体时长（秒）；用于即梦音频 2–15s 校验。加载失败/超时返回 null（放行，不误伤）。
-function probeMediaDuration(url, kind='audio'){
-    return new Promise(resolve => {
-        if(!url){ resolve(null); return; }
-        let done = false;
-        const finish = value => { if(done) return; done = true; try { el.src = ''; } catch(e){} resolve(value); };
-        let el;
-        try {
-            el = document.createElement(kind === 'video' ? 'video' : 'audio');
-        } catch(e){ resolve(null); return; }
-        el.preload = 'metadata';
-        el.onloadedmetadata = () => { const d = Number(el.duration); finish(Number.isFinite(d) && d > 0 ? d : null); };
-        el.onerror = () => finish(null);
-        setTimeout(() => finish(null), 8000);
-        try { el.src = url; } catch(e){ finish(null); }
-    });
-}
-async function runSmartComfyUpscale(imageUrl, resolution){
-    if(!imageUrl) throw new Error(tr('smart.errRunFailed'));
-    const inputName = await comfyNameForRef({url:imageUrl, name:'smart-upscale-input.png'});
-    return runQueuedSmartComfyGenerate({
-        workflow_json:'upscale.json',
-        params:{
-            "15":{image:inputName},
-            "172":{seed:Math.floor(Math.random() * 4294967295), resolution:Number(resolution || 2048)}
-        },
-        type:'enhance',
-        client_id:smartClientId
-    });
-}
 async function runComfyGeneration(node, prompt, refs, pendingNode, meta, runSettings=settings){
     const allRefs = refs || [];
     refs = imageRefsOnly(allRefs);
@@ -15672,12 +14995,7 @@ async function runComfyEnhance(node, refs, pendingNode, meta, runSettings=settin
     if(!refs.length) throw new Error(tr('smart.errEnhanceNeedRefs'));
     const inputName = await comfyNameForRef(refs[0]);
     const data = await runQueuedSmartComfyGenerate({workflow_json:'Z-Image-Enhance.json', type:'enhance', params:{"15":{image:inputName},"204":{value:Number(runSettings.enhanceStrength ?? 0.5)}}, client_id:smartClientId});
-    //修复超分勾选
-    let out = data.outputs || data.images || [];
-    if(runSettings.enhanceUpscale && out[0]){
-        const upscale = await runSmartComfyUpscale(out[0], runSettings.enhanceUpscaleRes || 2048);
-        out = upscale.outputs || upscale.images || [];
-    }
+    const out = data.outputs || data.images || [];
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
     if(pendingNode){
         finalizePendingNode(pendingNode, out, meta);
@@ -15693,12 +15011,7 @@ async function runComfyEdit(node, prompt, refs, pendingNode, meta, runSettings=s
     const names = [];
     for(const ref of refs.slice(0, 3)) names.push(await comfyNameForRef(ref));
     const data = await runQueuedSmartComfyGenerate({prompt, workflow_json:'Flux2-Klein.json', type:'klein', params:{"168":{text:prompt},"158":{noise_seed:Math.floor(Math.random()*1000000)},"278":{image:names[0] || ""},"270":{image:names[1] || ""},"292":{image:names[2] || ""},"313":{value:Boolean(names[1])},"314":{value:Boolean(names[2])}}, client_id:smartClientId});
-    //修复超分勾选
-    let out = data.outputs || data.images || [];
-    if(runSettings.editUpscale && out[0]){
-        const upscale = await runSmartComfyUpscale(out[0], runSettings.editUpscaleRes || 2048);
-        out = upscale.outputs || upscale.images || [];
-    }
+    const out = data.outputs || data.images || [];
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
     if(pendingNode){
         finalizePendingNode(pendingNode, out, meta);
@@ -16359,7 +15672,6 @@ shell.onmousedown = e => {
         didPan = false;
         connectionEraseState = {started:false, count:0, indices:new Set(), lastX:e.clientX, lastY:e.clientY, trail:[]};
         shell.classList.add('connection-erasing');
-        document.body.classList.add('smart-canvas-interacting');
         updateConnectionEraseTrail(e);
         eraseConnectionsAtPoint(e);
         return;
@@ -16368,7 +15680,6 @@ shell.onmousedown = e => {
         e.preventDefault();
         didPan = false;
         selectionState = {startScreen:{x:e.clientX, y:e.clientY}, startWorld:screenToWorld(e)};
-        document.body.classList.add('smart-canvas-interacting');
         updateSelectionBox(e);
         return;
     }
@@ -16376,7 +15687,6 @@ shell.onmousedown = e => {
         e.preventDefault();
         didPan = false;
         selectionState = {startScreen:{x:e.clientX, y:e.clientY}, startWorld:screenToWorld(e)};
-        document.body.classList.add('smart-canvas-interacting');
         updateSelectionBox(e);
         return;
     }
@@ -16385,7 +15695,6 @@ shell.onmousedown = e => {
     didPan = false;
     panState = {button:e.button, startX:e.clientX, startY:e.clientY, ox:viewport.x, oy:viewport.y};
     shell.classList.add('panning');
-    document.body.classList.add('smart-canvas-interacting');
 };
 shell.oncontextmenu = e => {
     if((e.ctrlKey || e.metaKey) || isRKeyDown){
@@ -16714,7 +16023,6 @@ window.onmousemove = e => {
 window.onmouseup = e => {
     document.body.classList.remove('smart-node-drag');
     document.body.classList.remove('smart-node-resize');
-    document.body.classList.remove('smart-canvas-interacting');
     if(connectionEraseState){
         const changed = finishConnectionErase();
         connectionEraseState = null;
@@ -16756,7 +16064,6 @@ window.onmouseup = e => {
         } else { discardPendingUndo(); }
         resizeState = null;
         if(changed) render();
-        else if(node && selectedId === node.id) positionComposerForNode(node);
         scheduleSave();
     }
     if(llmInstructionResizeState){
@@ -16893,8 +16200,6 @@ window.onmouseup = e => {
         clearDropHighlight();
         loopInsertPreview = null;
         dragState = null;
-        const active = selectedNode();
-        if(active) positionComposerForNode(active);
         scheduleSave();
         scheduleConnectionLayerRefresh();
     }
@@ -16906,7 +16211,7 @@ shell.addEventListener('wheel', e => {
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     const before = {x:(sx - viewport.x) / viewport.scale, y:(sy - viewport.y) / viewport.scale};
-    const factor = canvasWheelZoomFactor(e, shell.clientHeight || window.innerHeight || 800);
+    const factor = Math.exp(-e.deltaY * 0.001);
     viewport.scale = safeScale(viewport.scale * factor);
     viewport.x = sx - before.x * viewport.scale;
     viewport.y = sy - before.y * viewport.scale;
@@ -17396,28 +16701,6 @@ async function handleAssetPanelDrop(e){
     e.stopPropagation();
     setAssetDragOver(false);
     const raw = e.dataTransfer.getData('application/x-smart-canvas-image');
-    if(assetTab === 'url'){
-        try {
-            if(raw){
-                const payload = JSON.parse(raw);
-                if(payload?.url) await addMediaItemsToAssetUrlLibrary([{url:payload.url, name:payload.name || smartImageNameFromUrl(payload.url)}]);
-                return;
-            }
-            const payload = await resolveSmartImageDropPayload(e.dataTransfer);
-            if(payload.type === 'files'){
-                await addUploadedImagesToAssetUrlLibrary(payload.files);
-            } else if(payload.type === 'localPaths'){
-                const imported = await importSmartLocalImages(payload.localPaths);
-                await addMediaItemsToAssetUrlLibrary(imported);
-            } else if(payload.type === 'url'){
-                await saveUrlsToAssetUrlLibrary([payload.url], [smartImageNameFromUrl(payload.url)]);
-                toast('已保存 URL 素材');
-            }
-        } catch(err) {
-            toast(err.message || '上传图片失败');
-        }
-        return;
-    }
     if(raw){
         try {
             const payload = JSON.parse(raw);
@@ -17799,19 +17082,21 @@ window.addEventListener('resize', () => {
 window.addEventListener('studio-theme-change', event => applyTheme(event.detail?.theme || 'light'));
 try {
     const apiChannel = new BroadcastChannel('studio-api');
-    apiChannel.onmessage = event => {
-        scheduleSmartConfigRefreshFromEvent(event.data);
+    apiChannel.onmessage = async event => {
+        if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed'){
+            await refreshSmartConfigFromSettings();
+        }
         if(event.data?.type === 'asset_library_updated') handleAssetLibraryUpdatedMessage(event.data);
         if(event.data?.type === 'canvas_updated') handleCanvasUpdatedMessage(event.data);
     };
 } catch(e) {}
 window.addEventListener('focus', () => {
-    if(Date.now() - lastConfigRefreshAt > SMART_CONFIG_FOCUS_REFRESH_MS) scheduleSmartConfigRefresh(420);
+    if(Date.now() - lastConfigRefreshAt > 1200) refreshSmartConfigFromSettings();
 });
 window.addEventListener('message', event => {
     if(event.origin && event.origin !== location.origin) return;
     if(event.data?.type === 'studio-theme') applyTheme(event.data.theme || 'light');
-    scheduleSmartConfigRefreshFromEvent(event.data);
+    if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed') refreshSmartConfigFromSettings();
     if(event.data?.type === 'asset_library_updated') handleAssetLibraryUpdatedMessage(event.data);
     if(event.data?.type === 'canvas_updated') handleCanvasUpdatedMessage(event.data);
     if(event.data?.type === 'studio-lang' && window.StudioI18n) {

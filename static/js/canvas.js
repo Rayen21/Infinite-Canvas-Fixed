@@ -164,10 +164,8 @@ function canvasImageNearViewport(img){
     const boardRect = board.getBoundingClientRect();
     const rect = img.getBoundingClientRect();
     const margin = 220;
-    return rect.right >= boardRect.left - margin
-        && rect.left <= boardRect.right + margin
-        && rect.bottom >= boardRect.top - margin
-        && rect.top <= boardRect.bottom + margin;
+    return rect.right >= boardRect.left - margin && rect.left <= boardRect.right + margin
+        && rect.bottom >= boardRect.top - margin && rect.top <= boardRect.bottom + margin;
 }
 function syncCanvasSelectedImageResolution(root=nodesEl){
     const selectedImages = [];
@@ -223,52 +221,22 @@ function applyLanguage(lang){
     renderCanvasList();
     render();
 }
-const CANVAS_API_CONFIG_EVENT_TYPES = new Set(['providers-changed','workflows-changed','comfy-instances-changed']);
-const canvasApiConfigEventsSeen = new Map();
-let canvasConfigRefreshTimer = 0;
-let canvasConfigRefreshPromise = null;
-function shouldHandleCanvasApiConfigEvent(data){
-    if(!CANVAS_API_CONFIG_EVENT_TYPES.has(data?.type)) return false;
-    const key = [data.type, data.updated_at || '', data.source || ''].join('|');
-    const now = Date.now();
-    const last = canvasApiConfigEventsSeen.get(key) || 0;
-    if(last && now - last < 1200) return false;
-    canvasApiConfigEventsSeen.set(key, now);
-    if(canvasApiConfigEventsSeen.size > 40) {
-        Array.from(canvasApiConfigEventsSeen.entries()).forEach(([eventKey, at]) => {
-            if(now - at > 2500) canvasApiConfigEventsSeen.delete(eventKey);
-        });
-    }
-    return true;
-}
-function scheduleCanvasConfigRefreshFromEvent(data, delay=520){
-    if(!shouldHandleCanvasApiConfigEvent(data)) return;
-    if(canvasConfigRefreshTimer) clearTimeout(canvasConfigRefreshTimer);
-    canvasConfigRefreshTimer = setTimeout(() => {
-        canvasConfigRefreshTimer = 0;
-        refreshCanvasConfigFromSettings();
-    }, Math.max(0, Number(delay) || 0));
-}
 async function refreshCanvasConfigFromSettings(){
-    if(canvasConfigRefreshPromise) return canvasConfigRefreshPromise;
-    canvasConfigRefreshPromise = (async () => {
-        await loadConfig();
-        pruneMissingComfyWorkflows();
-        (nodes || []).forEach(node => {
-            sanitizeImageNodeProviderModel(node);
-            sanitizeVideoNodeProviderModel(node);
-        });
-        if(typeof render === 'function') render();
-    })().finally(() => {
-        canvasConfigRefreshPromise = null;
+    await loadConfig();
+    pruneMissingComfyWorkflows();
+    (nodes || []).forEach(node => {
+        sanitizeImageNodeProviderModel(node);
+        sanitizeVideoNodeProviderModel(node);
     });
-    return canvasConfigRefreshPromise;
+    if(typeof render === 'function') render();
 }
 window.addEventListener('message', event => {
     if(event.origin && event.origin !== location.origin) return;
     if(event.data?.type === 'studio-lang') applyLanguage(event.data.lang);
     if(event.data?.type === 'canvas_updated') handleCanvasUpdatedMessage(event.data);
-    scheduleCanvasConfigRefreshFromEvent(event.data);
+    if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed'){
+        refreshCanvasConfigFromSettings();
+    }
     if(event.data?.type === 'canvas-focus'){
         // 从其他标签页切换回画布时，重新拉取工作流列表并刷新节点
         refreshCanvasConfigFromSettings();
@@ -578,7 +546,6 @@ const DEFAULT_VIDEO_MODELS = [
     // Agnes
     'agnes-video-v2.0'
 ];
-const JIMENG_SEEDANCE_VIDEO_MODELS = ['seedance2.0_vip', 'seedance2.0fast_vip', 'seedance2.0', 'seedance2.0fast', 'seedance2.0mini'];
 
 function uid(prefix='n'){ return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now()}`; }
 function loadLocalViewportMap(){
@@ -746,12 +713,7 @@ function videoProviderOptions(selectedId){
 function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
-    const isJimeng = String(providerId || '').trim().toLowerCase() === 'jimeng'
-        || String(provider?.protocol || '').trim().toLowerCase() === 'jimeng';
-    const models = isJimeng
-        ? [...(provider?.video_models || []), ...JIMENG_SEEDANCE_VIDEO_MODELS]
-        : (provider?.video_models || []);
-    return uniqueModels(models);
+    return uniqueModels(provider?.video_models || []);
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
@@ -1197,13 +1159,6 @@ function screenToWorld(clientX, clientY){
     const rect = board.getBoundingClientRect();
     return { x:(clientX - rect.left - viewport.x) / viewport.scale, y:(clientY - rect.top - viewport.y) / viewport.scale };
 }
-function canvasWheelZoomFactor(event, pageSize){
-    const unit = event.deltaMode === 1 ? 40 : event.deltaMode === 2 ? pageSize : 1;
-    const isMac = /^Mac/.test(navigator.platform || '');
-    const sensitivity = 0.0008;
-    const macMultiplier = isMac ? 1.15 : 1;
-    return Math.exp(-event.deltaY * unit * sensitivity * macMultiplier);
-}
 function applyViewport(){
     world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`;
     scheduleMinimapRender();
@@ -1555,7 +1510,11 @@ async function loadConfig(){
 // 监听 API 设置页面的变更广播，实时刷新画布的模型/平台下拉
 try {
     const apiChannel = new BroadcastChannel('studio-api');
-    apiChannel.onmessage = e => scheduleCanvasConfigRefreshFromEvent(e.data);
+    apiChannel.onmessage = async (e) => {
+        if(e.data?.type === 'providers-changed' || e.data?.type === 'workflows-changed' || e.data?.type === 'comfy-instances-changed'){
+            await refreshCanvasConfigFromSettings();
+        }
+    };
 } catch(e) { /* 不支持 BroadcastChannel 的旧浏览器忽略 */ }
 function msChatModelOptions(selected){
     // 单一数据源：从 API 设置里 modelscope 平台的 chat_models 取
@@ -10482,8 +10441,6 @@ async function runGenerator(genId, opts={}){
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
         size:await generatorSizeForRun(gen, refs),
-        aspect_ratio:gen.ratio === 'custom' ? (gen.customRatio || '') : (gen.ratio || ''),
-        resolution:gen.resolution || '',
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
     const quality = normalizedImageQuality(gen.quality);
@@ -11510,7 +11467,9 @@ async function callCanvasLLM(node, message, messages=[], options={}){
             model,
             ms_model: llmProv === 'modelscope' ? model : '',
             provider: llmProv,
-            system_prompt:node.systemPrompt || 'You are a helpful assistant.',
+            // The System switch controls whether any system message is sent.
+            // Keep the default only when the user explicitly enables it.
+            system_prompt:node.showSystem ? ((node.systemPrompt || '').trim() || 'You are a helpful assistant.') : '',
             messages,
             images,
             videos,
@@ -12133,48 +12092,6 @@ function logTaskLabel(log){
     }
     return log?.model || '-';
 }
-async function deleteCanvasLogEntry(logId, deleteMedia=false){
-    if(!canvas || !logId) return;
-    const confirmText = deleteMedia ? tr('canvas.deleteLogMediaConfirm') : tr('canvas.deleteLogConfirm');
-    if(!confirm(confirmText)) return;
-    try {
-        if(localCanvasDirty || saveTimer){
-            clearTimeout(saveTimer);
-            saveTimer = null;
-            await saveCanvas();
-        }
-        const res = await fetch(`/api/canvases/${encodeURIComponent(canvas.id)}/logs/delete`, {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({
-                log_id:logId,
-                delete_unreferenced_media:deleteMedia,
-                reset_referencing_nodes:deleteMedia,
-                base_updated_at:Number(canvas.updated_at || lastCanvasUpdatedAt || 0)
-            })
-        });
-        const data = await res.json().catch(() => ({}));
-        if(!res.ok) throw new Error(data.detail || tr('canvas.logDeleteFailed'));
-        canvas.logs = data.canvas?.logs || (canvas.logs || []).filter(item => item.id !== logId);
-        if(data.canvas?.nodes){
-            canvas.nodes = data.canvas.nodes;
-            canvas.connections = data.canvas.connections || [];
-            nodes = canvas.nodes;
-            connections = canvas.connections;
-            render();
-        }
-        canvas.updated_at = Number(data.canvas?.updated_at || canvas.updated_at || Date.now());
-        lastCanvasUpdatedAt = canvas.updated_at;
-        renderCanvasLog();
-        const notes = [tr('canvas.logDeleted')];
-        if(data.removed_files?.length) notes.push(tr('canvas.logMediaRemoved').replace('{n}', data.removed_files.length));
-        if(data.reset_node_ids?.length) notes.push(tr('canvas.logNodesReset').replace('{n}', data.reset_node_ids.length));
-        if(data.skipped_referenced?.length) notes.push(tr('canvas.logMediaReferenced').replace('{n}', data.skipped_referenced.length));
-        setStatus(notes.join(' · '));
-    } catch(err) {
-        setStatus(err?.message || tr('canvas.logDeleteFailed'));
-    }
-}
 function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
@@ -12223,7 +12140,7 @@ function renderCanvasLog(){
             idText ? `ID ${idText}` : '',
             backendText,
         ].filter(Boolean);
-        return `<div class="log-item ${log.status === 'failed' ? 'failed' : ''}" data-canvas-log-id="${escapeAttr(log.id || '')}">
+        return `<div class="log-item ${log.status === 'failed' ? 'failed' : ''}">
             <div class="log-main">
                 <div class="log-meta">
                     <span class="log-chip ${log.status === 'failed' ? 'status-failed' : 'status-ok'}">${escapeHtml(log.status === 'failed' ? tr('canvas.failed') : tr('canvas.success'))}</span>
@@ -12234,10 +12151,6 @@ function renderCanvasLog(){
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
                 ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
-                <div class="log-actions">
-                    <button type="button" data-log-delete="record"><i data-lucide="list-x"></i><span>${escapeHtml(tr('canvas.deleteLog'))}</span></button>
-                    <button type="button" class="danger" data-log-delete="media"><i data-lucide="trash-2"></i><span>${escapeHtml(tr('canvas.deleteLogAndMedia'))}</span></button>
-                </div>
             </div>
             <div class="log-thumbs">${thumbs}</div>
         </div>`;
@@ -12267,13 +12180,6 @@ function renderCanvasLog(){
     };
     bindCanvasLogCopy('[data-prompt]', 'prompt');
     bindCanvasLogCopy('[data-error]', 'error');
-    list.querySelectorAll('[data-log-delete]').forEach(button => {
-        button.onclick = e => {
-            e.stopPropagation();
-            const logId = button.closest('[data-canvas-log-id]')?.dataset.canvasLogId || '';
-            deleteCanvasLogEntry(logId, button.dataset.logDelete === 'media');
-        };
-    });
     refreshIcons();
 }
 async function importWorkflowAssetUrl(url, name='workflow'){
@@ -14699,7 +14605,7 @@ board.onwheel = e => {
     if(!canvas) return;
     e.preventDefault();
     const before = screenToWorld(e.clientX, e.clientY);
-    viewport.scale = safeViewportScale(viewport.scale * canvasWheelZoomFactor(e, board.clientHeight || window.innerHeight || 800));
+    viewport.scale = viewport.scale * (e.deltaY > 0 ? .92 : 1.08);
     const rect = board.getBoundingClientRect();
     viewport.x = e.clientX - rect.left - before.x * viewport.scale;
     viewport.y = e.clientY - rect.top - before.y * viewport.scale;

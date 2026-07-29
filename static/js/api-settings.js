@@ -93,7 +93,7 @@ const CODEX_DEFAULT_CHAT_MODELS = ['gpt-5.5'];
 const GEMINI_CLI_DEFAULT_IMAGE_MODELS = ['auto'];
 const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto'];
 const CLI_PROTOCOLS = new Set(['jimeng', 'codex', 'gemini-cli']);
-const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'grok', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
+const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'tudou', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
 const CLI_PROVIDER_PRESETS = {
     jimeng:{id:'jimeng', name:'即梦 CLI', protocol:'jimeng'},
     codex:{id:'codex', name:'GPT CLI', protocol:'codex'},
@@ -158,16 +158,16 @@ const RECOMMENDED_APIS = [
         name:'土豆API',
         category:'value',
         base_url:'https://api.ai-tudou.net',
-        protocol:'openai',
+        protocol:'tudou',
         image_request_mode:'openai',
         register_url:'https://api.ai-tudou.net/register?aff=GmBu',
         tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
         icons:['IMG','VID','LLM'],
         summaryKey:'api.recommendTudouSummary',
-        advantages:['OpenAI 兼容接入', '支持 LLM、图像和视频模型', 'Gemini 模型已预设 Gemini 协议'],
-        image_models:['gpt-image-2', 'gpt-image-2-1k', 'gpt-image-2-2k', 'gpt-image-2-4k', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview'],
+        advantages:['支持 LLM、图像和视频模型', 'Grok 图像专属图生图协议', '异步视频模型已预设'],
+        image_models:['gpt-image-2-1k', 'gpt-image-2-2k', 'gpt-image-2-4k', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview', 'grok-imagine-image', 'grok-imagine-image-pro', 'grok-imagine-image-edit'],
         chat_models:['gpt-5.5'],
-        video_models:[],
+        video_models:['grok-imagine-video', 'grok-imagine-video-1.5', 'sora2', 'veo3.1', 'kling-v3', 'pixverse-v6', 'seedance-2.0-fast'],
         model_protocols:{'gemini-3.1-flash-image-preview':'gemini', 'gemini-3-pro-image-preview':'gemini'}
     },
     {
@@ -195,13 +195,13 @@ const RECOMMENDED_APIS = [
         category:'value',
         base_url:'https://www.fhl.mom',
         protocol:'openai',
-        // FHL 生图走 OpenAI Responses / image_generation，避免 edits 长任务返回半截 keepalive。
-        image_request_mode:'openai-responses',
+        // FHL 生图当前走 OpenAI Images 协议：文生图 /v1/images/generations，图生图 /v1/images/edits
+        image_request_mode:'openai',
         register_url:'https://www.fhl.mom/register?aff=86L574B4T2N9',
         tagKeys:['Codex','Claude','api.tagGptImage2'],
         icons:['CODEX','GPT','IMG'],
         summaryKey:'api.recommendFhlSummary',
-        advantages:['稳定便宜接入 codex/Claude/GPT Image 2出图', 'OpenAI RS 生图直连', '预填 gpt-image-2 全系模型'],
+        advantages:['稳定便宜接入 codex/Claude/GPT Image 2出图', 'OpenAI Images 生图直连', '预填 gpt-image-2 全系模型'],
         image_models:['gpt-image-2', 'gpt-image-2-2k', 'gpt-image-2-4k', 'nano-banana'],
         chat_models:['gpt-5.5'],
         video_models:[]
@@ -301,10 +301,39 @@ const RECOMMEND_GROUPS = [
     {key:'value', titleKey:'api.recommendGroupValue', icon:'badge-percent'},
     {key:'free', titleKey:'api.recommendGroupFree', icon:'gift'}
 ];
-const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set();
-function lockedRecommendedApi(){ return null; }
-function hasLockedRecommendedProtocol(){ return false; }
-function applyLockedRecommendedProtocol(){ return false; }
+const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['tudou', 'exellome', 'fhl']);
+function lockedRecommendedApi(itemOrId){
+    const id = typeof itemOrId === 'string' ? itemOrId : itemOrId?.id;
+    const name = typeof itemOrId === 'string' ? '' : itemOrId?.name;
+    const baseUrl = typeof itemOrId === 'string' ? '' : itemOrId?.base_url;
+    const normalizedId = String(id || '').trim().toLowerCase();
+    const normalizedName = String(name || '').trim().toLowerCase();
+    const normalizedBase = String(baseUrl || '').trim().replace(/\/+$/, '').toLowerCase();
+    const normalizedHost = (() => {
+        try { return new URL(normalizedBase).host.toLowerCase(); } catch(e) { return ''; }
+    })();
+    return RECOMMENDED_APIS.find(api => {
+        if(!LOCKED_RECOMMENDED_PROTOCOL_IDS.has(api.id)) return false;
+        const apiBase = String(api.base_url || '').trim().replace(/\/+$/, '').toLowerCase();
+        const apiHost = (() => {
+            try { return new URL(apiBase).host.toLowerCase(); } catch(e) { return ''; }
+        })();
+        return normalizedId === api.id
+            || normalizedName === String(api.name || '').trim().toLowerCase()
+            || (apiBase && normalizedBase === apiBase)
+            || (apiHost && normalizedHost === apiHost);
+    }) || null;
+}
+function hasLockedRecommendedProtocol(itemOrId){
+    return Boolean(lockedRecommendedApi(itemOrId));
+}
+function applyLockedRecommendedProtocol(item){
+    const api = lockedRecommendedApi(item);
+    if(!item || !api) return false;
+    item.protocol = String(api.protocol || 'openai').toLowerCase();
+    item.image_request_mode = normalizeImageRequestMode(api.image_request_mode);
+    return true;
+}
 
 function refreshIcons(){ if(window.lucide) lucide.createIcons(); }
 function tr(key){ return window.StudioI18n ? window.StudioI18n.t(key) : key; }
@@ -316,30 +345,11 @@ function trf(key, vars={}){
     return text;
 }
 function setStatus(text){ statusEl.textContent = text || ''; }
-let studioApiBroadcastChannel = null;
-let studioApiBroadcastTimer = 0;
-let studioApiBroadcastTypes = new Set();
-const studioApiBroadcastSource = `api-settings-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-function emitStudioApiChange(type){
-    const message = { type, updated_at:Date.now(), source:studioApiBroadcastSource };
-    try {
-        studioApiBroadcastChannel = studioApiBroadcastChannel || new BroadcastChannel('studio-api');
-        studioApiBroadcastChannel.postMessage(message);
-    } catch(e) {}
-    try { window.parent?.postMessage(message, '*'); } catch(e) {}
-    if(window.top && window.top !== window.parent) {
-        try { window.top.postMessage(message, '*'); } catch(e) {}
-    }
-}
 function broadcastStudioApiChange(type='providers-changed'){
-    studioApiBroadcastTypes.add(type);
-    if(studioApiBroadcastTimer) clearTimeout(studioApiBroadcastTimer);
-    studioApiBroadcastTimer = setTimeout(() => {
-        const types = Array.from(studioApiBroadcastTypes);
-        studioApiBroadcastTypes.clear();
-        studioApiBroadcastTimer = 0;
-        types.forEach(emitStudioApiChange);
-    }, 120);
+    const message = { type, updated_at:Date.now() };
+    try { new BroadcastChannel('studio-api').postMessage(message); } catch(e) {}
+    try { window.parent?.postMessage(message, '*'); } catch(e) {}
+    try { window.top?.postMessage(message, '*'); } catch(e) {}
 }
 function rhEditorSideScrollEl(){
     return rhWorkflowEditorNodeList?.closest?.('.rh-workflow-editor-side') || rhWorkflowEditorNodeList;
@@ -3015,7 +3025,7 @@ async function probeAsync(){
         const detectedProtocol = String(data.protocol || '').toLowerCase();
         const isAsync = data.ok === true && detectedProtocol === 'apimart';
         const isOpenAiCompat = data.ok === true && detectedProtocol === 'openai';
-        const keepManualProtocol = ['gemini', 'grok', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(currentProtocol);
+        const keepManualProtocol = ['gemini', 'tudou', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(currentProtocol);
         if(protocolInput && !keepManualProtocol){
             applyDetectedProtocol(detectedProtocol || (isAsync ? 'apimart' : 'openai'));
         }
@@ -3032,7 +3042,7 @@ async function probeAsync(){
                 : detectedProtocol === 'openai'
                     ? 'OpenAI 兼容'
                     : keepManualProtocol
-                    ? (currentProtocol === 'gemini' ? 'Gemini' : currentProtocol === 'grok' ? 'Grok' : currentProtocol.toUpperCase())
+                    ? (currentProtocol === 'gemini' ? 'Gemini' : currentProtocol.toUpperCase())
                     : 'OpenAI 兼容';
         showVerifyResult(`
             ${hideTasksEndpointTip ? '' : `<div style="font-size:11px;font-weight:800;color:${color}">${icon} ${escapeHtml(probeMessage)}</div>`}
@@ -3042,7 +3052,7 @@ async function probeAsync(){
                 <pre style="margin-top:6px;padding:10px 12px;border-radius:10px;background:var(--soft);border:1px solid var(--line-2);font-size:10.5px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;color:var(--text);max-height:200px;overflow:auto">${escapeHtml(rawJson)}</pre>
             </details>`);
     } catch(e){
-        const keepManualProtocol = ['gemini', 'grok', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
+        const keepManualProtocol = ['gemini', 'tudou', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
         if(protocolInput && !keepManualProtocol){ protocolInput.value = 'openai'; protocolInput.dispatchEvent(new Event('change')); }
         const suffix = keepManualProtocol ? '，已保留当前手动选择的协议' : '，协议已设为 OpenAI 兼容';
         showVerifyResult(`<div style="font-size:11px;font-weight:800;color:#b45309">⚠ ${escapeHtml(e.message || String(e))}${suffix}</div>`);
@@ -3401,10 +3411,9 @@ function providerSupportsModelProtocol(item){
     return Boolean(item) && !FIXED_PROTOCOL_PROVIDER_IDS.has(item.id);
 }
 function modelProtocolSelectHtml(kind, index, model, item){
-    if(!providerSupportsModelProtocol(item)) return '';
-    if(kind === 'video') return '';
+    if(kind === 'video' || !providerSupportsModelProtocol(item)) return '';
     const map = (item.model_protocols && typeof item.model_protocols === 'object') ? item.model_protocols : {};
-    let current = String(map[String(model || '').trim()] || '').toLowerCase();
+    const current = String(map[String(model || '').trim()] || '').toLowerCase();
     const opt = (val, label) => `<option value="${val}" ${current === val ? 'selected' : ''}>${label}</option>`;
     return `<select class="model-protocol-select" title="该模型使用的协议，默认跟随平台全局协议" onchange="updateModelProtocol('${kind}', ${index}, this.value)">
         <option value="" ${current === '' ? 'selected' : ''}>默认</option>
@@ -3651,31 +3660,6 @@ function modelProtocolStillUsed(item, name){
     const lists = ['image_models', 'chat_models', 'video_models'];
     return lists.some(k => Array.isArray(item[k]) && item[k].includes(name));
 }
-function sanitizeModelProtocols(item){
-    const source = (item?.model_protocols && typeof item.model_protocols === 'object') ? item.model_protocols : {};
-    const imageChatModels = new Set([...(item?.image_models || []), ...(item?.chat_models || [])].map(model => String(model || '').trim()).filter(Boolean));
-    const out = {};
-    Object.entries(source).forEach(([rawName, rawProto]) => {
-        const name = String(rawName || '').trim();
-        const proto = String(rawProto || '').trim().toLowerCase();
-        if(!name) return;
-        if(imageChatModels.has(name) && (proto === 'openai' || proto === 'gemini')){
-            out[name] = proto;
-        }
-    });
-    return out;
-}
-function applyAutoModelProtocols(item){
-    if(!providerSupportsModelProtocol(item)) return;
-    if(!item.model_protocols || typeof item.model_protocols !== 'object') item.model_protocols = {};
-    [...(item.image_models || []), ...(item.chat_models || [])].forEach(model => {
-        const name = String(model || '').trim();
-        if(!name) return;
-        if(name.toLowerCase().includes('gemini') && !item.model_protocols[name]){
-            item.model_protocols[name] = 'gemini';
-        }
-    });
-}
 function updateModel(kind, index, value){
     const item = provider();
     const key = kind === 'image' ? 'image_models' : kind === 'video' ? 'video_models' : 'chat_models';
@@ -3711,7 +3695,7 @@ function updateModelProtocol(kind, index, value){
     if(!name) return;
     if(!item.model_protocols || typeof item.model_protocols !== 'object') item.model_protocols = {};
     const proto = String(value || '').trim().toLowerCase();
-    if(kind !== 'video' && (proto === 'openai' || proto === 'gemini')){
+    if(proto === 'openai' || proto === 'gemini'){
         item.model_protocols[name] = proto;
     } else {
         delete item.model_protocols[name];
@@ -3778,8 +3762,6 @@ async function saveProviders(){
         item.image_models = unique(item.image_models || []);
         item.chat_models = unique(item.chat_models || []);
         item.video_models = unique(item.video_models || []);
-        applyAutoModelProtocols(item);
-        item.model_protocols = sanitizeModelProtocols(item);
         const modelNameSource = (item.model_names && typeof item.model_names === 'object') ? item.model_names : {};
         const modelNameMap = {};
         [...item.image_models, ...item.chat_models, ...item.video_models].forEach(model => {
