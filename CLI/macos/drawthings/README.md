@@ -26,12 +26,6 @@ python -m pip install -r CLI/macos/drawthings/requirements-Dt-gRPC.txt
 
 该连接目前用于图片生成、单图图生图和 Hint 多图编辑，不提供聊天模型能力。Hint 最多支持四张图片，每张图片可在画布节点中独立设置控制类型。
 
-## 本地 smoke test
 
-`drawthings_*_smoke_test.py` 仅用于本机联调，已经被 Git 忽略，不会同步到 GitHub。运行测试前需要确保：
-
-1. gRPCServerCLI 已经启动。
-2. 当前环境已安装上面的独立依赖。
-3. 测试使用的模型名称与 Draw Things 当前实时模型列表中的文件名一致。
-
-测试输出图片也会被 Git 忽略。
+<img width="1282" height="727" alt="image" src="https://github.com/user-attachments/assets/2424ae77-a8cf-4773-b7a3-45ff94e352d0" />
+<img width="721" height="572" alt="image" src="https://github.com/user-attachments/assets/17d7d44d-e442-47d7-9ab3-5af508acf70d" />
