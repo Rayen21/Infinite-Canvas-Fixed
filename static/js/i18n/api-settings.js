@@ -23,6 +23,7 @@
         "api.protocolGemini": { zh: "Gemini 协议", en: "Gemini Protocol" },
         "api.protocolTudou": { zh: "土豆 API 协议", en: "Tudou API Protocol" },
         "api.protocolVolcengine": { zh: "火山引擎协议", en: "Volcengine Protocol" },
+        "api.drawThingsMacOnly": { zh: "（只适用于 Mac M 芯片）", en: " (Mac M-series chips only)" },
         "api.key": { zh: "API Key", en: "API Key" },
         "api.msNotes": { zh: "ModelScope 使用提示", en: "ModelScope Notes" },
         "api.msChinaEndpoint": { zh: "国内默认请求地址：", en: "China endpoint: " },

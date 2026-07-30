@@ -2589,6 +2589,8 @@ function renderEditor(){
     if(isDrawThings){
         item.base_url = item.base_url || DRAW_THINGS_DEFAULT_ENDPOINT;
         item.protocol = 'grpc';
+        // Draw Things gRPCServerCLI only provides image generation on macOS M chips.
+        editorTitle.textContent = `${item.name || item.id}${tr('api.drawThingsMacOnly')}`;
         baseInput.value = item.base_url;
         baseInput.placeholder = DRAW_THINGS_DEFAULT_ENDPOINT;
         if(baseUrlLabel) baseUrlLabel.textContent = 'gRPCServerCLI 地址（主机:端口）';
