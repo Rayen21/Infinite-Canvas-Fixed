@@ -28,7 +28,7 @@ import functools
 import html
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 import httpx
 from PIL import Image, ImageOps
 from io import BytesIO
@@ -301,7 +301,7 @@ QUEUE_LOCK = Lock()
 HISTORY_LOCK = Lock()
 GLOBAL_CONFIG_LOCK = Lock()
 CONVERSATION_LOCK = Lock()
-CANVAS_LOCK = Lock()
+CANVAS_LOCK = RLock()
 LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
 NEXT_TASK_ID = 1
@@ -314,7 +314,7 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "tudou"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "tudou", "grpc"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json", "openai-video-proxy", "openai-responses"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
@@ -1270,11 +1270,12 @@ def normalize_provider(item):
         raise HTTPException(status_code=400, detail=f"API 平台 ID 不合法：{provider_id or '(empty)'}")
     name = re.sub(r"\s+", " ", str(item.get("name") or provider_id).strip())[:60] or provider_id
     base_url = str(item.get("base_url") or "").strip().rstrip("/")
-    if base_url and not re.match(r"^https?://", base_url):
-        raise HTTPException(status_code=400, detail=f"{name} 的 Base URL 需要以 http:// 或 https:// 开头")
     protocol = str(item.get("protocol") or "openai").strip().lower()
     if protocol not in SUPPORTED_PROVIDER_PROTOCOLS:
         protocol = "openai"
+    is_drawthings = provider_id == "drawthings" or protocol == "grpc"
+    if base_url and not is_drawthings and not re.match(r"^https?://", base_url):
+        raise HTTPException(status_code=400, detail=f"{name} 的 Base URL 需要以 http:// 或 https:// 开头")
     image_request_mode = detect_image_request_mode(base_url, item.get("image_models") or []) or normalize_image_request_mode(item.get("image_request_mode"))
     # Migrate existing Tudou entries by official host so their special request shapes
     # remain scoped to this provider instead of leaking into generic OpenAI handling.
@@ -1295,6 +1296,10 @@ def normalize_provider(item):
         base_url = ""
     if protocol in {"codex", "gemini-cli"}:
         base_url = ""
+    if provider_id == "drawthings" or protocol == "grpc":
+        provider_id = "drawthings"
+        name = name or "Draw Things gRPCServerCLI"
+        protocol = "grpc"
     if provider_id == "runninghub":
         protocol = "runninghub"
         base_url = base_url or RUNNINGHUB_DEFAULT_BASE_URL
@@ -2733,6 +2738,8 @@ class OnlineImageRequest(BaseModel):
     resolution: str = ""
     quality: str = "auto"
     n: int = 1
+    batch_size: int = 1
+    seed: Optional[int] = None
     reference_images: List[AIReference] = []
     operation: str = ""
     resolution_type: str = ""
@@ -4615,6 +4622,9 @@ def is_codex_provider(provider):
 
 def is_gemini_cli_provider(provider):
     return provider_protocol(provider) == "gemini-cli"
+
+def is_draw_things_provider(provider):
+    return provider_protocol(provider) == "grpc" or str((provider or {}).get("id") or "").strip().lower() == "drawthings"
 
 def codex_env_value(key):
     return os.getenv(key, "") or read_api_env_value(key)
@@ -11043,10 +11053,58 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
-async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution=""):
+async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution="", seed=None, batch_size=1):
     provider = get_api_provider(provider_id)
     if is_tudou_provider(provider):
         model = tudou_image_model_for_request(model)
+    if is_draw_things_provider(provider):
+        from draw_things_grpc import draw_things_model_supports_editing
+
+        drawthings_references = []
+        for reference in (reference_images or []):
+            item = dict(reference) if isinstance(reference, dict) else {"url": reference}
+            url = str(item.get("url") or "").strip()
+            # Canvas references normally use /output or /assets URLs. Resolve
+            # those to local files before passing them to the gRPC client;
+            # other providers keep their existing reference handling.
+            local_path = local_media_path_from_url(url)
+            if local_path:
+                drawthings_references.append({
+                    "path": local_path,
+                    "name": item.get("name") or os.path.basename(local_path),
+                    "weight": item.get("weight", 1.0),
+                })
+            elif url:
+                drawthings_references.append(item)
+        editing_model = draw_things_model_supports_editing(model)
+        if not editing_model and len(drawthings_references) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="当前 Draw Things 模型只支持文生图或单图图生图，不能输入多张参考图。",
+            )
+        try:
+            from draw_things_grpc import generate_draw_things_image
+            # The provider's saved host:port overrides environment defaults.
+            request_options = {
+                "endpoint": provider.get("base_url") or "",
+                "seed": seed,
+                "batch_size": batch_size,
+            }
+            if editing_model:
+                request_options.update(
+                    hint_images=drawthings_references,
+                    hint_type="shuffle" if drawthings_references else "",
+                )
+            else:
+                request_options.update(
+                    reference_images=drawthings_references,
+                )
+            image_item, raw = await generate_draw_things_image(
+                prompt, size, model, **request_options
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return image_item, raw
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     if is_codex_provider(provider):
@@ -13005,6 +13063,18 @@ async def ai_models():
 async def api_providers():
     return {"providers": public_api_providers()}
 
+@app.get("/api/drawthings/models")
+async def drawthings_models():
+    provider = next((item for item in load_api_providers() if item.get("id") == "drawthings"), None)
+    if not provider:
+        return {"connected": False, "models": [], "message": "Draw Things provider 尚未添加"}
+    result = await fetch_models_from_upstream(provider.get("base_url") or "", "", "grpc", "openai")
+    return {
+        "connected": bool(result.get("ok")),
+        "models": result.get("image_models") or [],
+        "message": result.get("message") or "",
+    }
+
 @app.put("/api/providers")
 async def save_providers(payload: List[ApiProviderPayload]):
     providers = []
@@ -13100,6 +13170,8 @@ def protocol_from_payload(payload):
         return "runninghub"
     if provider_id == "jimeng":
         return "jimeng"
+    if provider_id == "drawthings":
+        return "grpc"
     base_url = str(getattr(payload, "base_url", "") or "").strip().lower()
     if "runninghub.cn" in base_url or "runninghub.ai" in base_url:
         return "runninghub"
@@ -13110,6 +13182,8 @@ def api_key_from_payload(payload, protocol: str = ""):
     explicit = str(getattr(payload, "api_key", "") or "").strip()
     provider_id = str(getattr(payload, "provider_id", "") or "").strip().lower()
     protocol = str(protocol or protocol_from_payload(payload) or "").strip().lower()
+    if protocol == "grpc":
+        return ""
     if explicit:
         return explicit
     if provider_id:
@@ -13362,6 +13436,25 @@ async def test_provider_connection(payload: TestConnectionPayload):
             "protocol": "runninghub",
             "raw": payload_models.get("raw"),
         }
+    if protocol == "grpc":
+        try:
+            from draw_things_grpc import list_draw_things_models
+            result = await list_draw_things_models(payload.base_url)
+        except Exception as exc:
+            result = {"connected": False, "models": [], "error": str(exc)}
+        models = result.get("models") or []
+        return {
+            "ok": bool(result.get("connected")),
+            "protocol": "grpc",
+            "status": 200 if result.get("connected") else 0,
+            "message": "Draw Things gRPCServerCLI 已连接" if result.get("connected") else (result.get("error") or "Draw Things gRPCServerCLI 未连接"),
+            "model_count": len(models),
+            "image_models": models,
+            "chat_models": [],
+            "video_models": [],
+            "all": models,
+            "raw": result,
+        }
     base_url = (payload.base_url or "").strip().rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写请求地址")
@@ -13584,6 +13677,25 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
         payload = gemini_cli_models_payload(raw={"status": status})
         payload["message"] = status.get("message") or payload["message"]
         return payload
+    if protocol == "grpc":
+        try:
+            from draw_things_grpc import list_draw_things_models
+            result = await list_draw_things_models(base_url)
+        except Exception as exc:
+            result = {"connected": False, "models": [], "error": str(exc)}
+        models = result.get("models") or []
+        return {
+            "ok": bool(result.get("connected")),
+            "protocol": "grpc",
+            "status": 200 if result.get("connected") else 0,
+            "message": "Draw Things gRPCServerCLI 已连接" if result.get("connected") else (result.get("error") or "Draw Things gRPCServerCLI 未连接"),
+            "total": len(models),
+            "image_models": models,
+            "chat_models": [],
+            "video_models": [],
+            "all": models,
+            "raw": result,
+        }
     if protocol == "jimeng":
         return {
             "total": len(JIMENG_DEFAULT_IMAGE_MODELS) + len(JIMENG_DEFAULT_VIDEO_MODELS),
@@ -13716,6 +13828,8 @@ async def fetch_upstream_models(provider_id: str):
         return await fetch_models_from_upstream("", "", "codex", provider.get("image_request_mode") or "openai")
     if is_gemini_cli_provider(provider):
         return await fetch_models_from_upstream("", "", "gemini-cli", provider.get("image_request_mode") or "openai")
+    if is_draw_things_provider(provider):
+        return await fetch_models_from_upstream(provider.get("base_url") or "", "", "grpc", provider.get("image_request_mode") or "openai")
     api_key = os.getenv(runninghub_wallet_key_env(), "") if provider["id"] == "runninghub" else ""
     if not api_key:
         api_key = provider_env_key_value(provider["id"])
@@ -13731,7 +13845,10 @@ async def build_online_image_result(payload: OnlineImageRequest):
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
-    operation = str(payload.operation or "").strip().lower()
+    batch_size = max(1, min(8, int(payload.batch_size or 1))) if is_draw_things_provider(provider) else 1
+    if batch_size > 1:
+        count = 1
+    operation = str(getattr(payload, "operation", "") or "").strip().lower()
     if operation == "upscale":
         if not is_jimeng_provider(provider):
             raise HTTPException(status_code=400, detail="图片放大目前仅支持即梦（Dreamina）平台")
@@ -13744,7 +13861,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         else:
             image_data, raw_item = await generate_ai_image(
                 payload.prompt, request_size, payload.quality, model, image_refs, provider["id"],
-                payload.aspect_ratio, payload.resolution,
+                payload.aspect_ratio, payload.resolution, payload.seed, batch_size=batch_size,
             )
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
@@ -13788,7 +13905,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
+        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "aspect_ratio": payload.aspect_ratio, "resolution": payload.resolution, "quality": payload.quality, "n": count, "batch_size": batch_size, "reference_images": refs},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)

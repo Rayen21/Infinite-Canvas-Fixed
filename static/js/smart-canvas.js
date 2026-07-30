@@ -306,6 +306,9 @@ let settings = {
     model:'',
     ratio:'square',
     resolution:'4k',
+    // Draw Things 的 seed 只在选择 gRPC provider 时使用，其他 provider 不携带该字段。
+    drawThingsSeed:0,
+    drawThingsSeedRandom:true,
     customRatio:'',
     customRatioWidth:'',
     customRatioHeight:'',
@@ -702,6 +705,28 @@ function isGptImageAutoSizeModel(model){
 }
 function defaultSmartApiResolution(model){
     return isGptImageAutoSizeModel(model) ? '4k' : '1k';
+}
+// 生成结果按图片保存一份不可变的运行快照，避免后续修改节点参数覆盖历史结果。
+function snapshotImageGenerationMeta(meta){
+    if(!meta || typeof meta !== 'object') return null;
+    return {
+        prompt:meta.prompt || '',
+        displayPrompt:meta.displayPrompt || meta.promptText || meta.prompt || '',
+        promptHtml:meta.promptHtml || '',
+        promptText:meta.promptText || meta.displayPrompt || meta.prompt || '',
+        promptRefs:cloneSmartSettings(meta.promptRefs || []),
+        inputRefs:cloneSmartSettings(meta.inputRefs || meta.promptRefs || []),
+        sourceNodeId:meta.sourceNodeId || '',
+        settings:cloneSmartSettings(meta.settings || {}),
+        createdAt:Number(meta.createdAt || Date.now())
+    };
+}
+function attachImageGenerationMeta(images=[], meta=null){
+    const snapshot = snapshotImageGenerationMeta(meta);
+    if(!snapshot) return images || [];
+    return (images || []).map(img => img?.url
+        ? {...img, generationMeta:snapshotImageGenerationMeta(snapshot)}
+        : img);
 }
 function mediaItemForStorage(item){
     if(!item || typeof item !== 'object') return item;
@@ -1136,7 +1161,8 @@ function stripOutpaintDisplaySettings(settingsObj, node=null){
     return clean;
 }
 function smartSettingsForNode(node){
-    const nodeSettings = stripOutpaintDisplaySettings(node?.runSettings || {}, node);
+    const imageMeta = selectedImageGenerationMetaForNode(node);
+    const nodeSettings = stripOutpaintDisplaySettings(imageMeta?.settings || node?.runSettings || {}, node);
     const recentSettings = Object.keys(nodeSettings).length ? {} : recentSmartSettingsForMode();
     const base = {
         ...cloneSmartSettings(canvasDefaultSmartSettings || initialSmartSettings),
@@ -1145,6 +1171,17 @@ function smartSettingsForNode(node){
     };
     normalizeSmartVideoModeSettings(base, true);
     return withOutpaintDisplaySettings(node, base);
+}
+function selectedImageGenerationMetaForNode(node){
+    if(!node || selectedImage.index < 0 || !selectedImage.nodeId) return null;
+    const owner = nodes.find(item => item.id === selectedImage.nodeId);
+    if(!owner || !owner.images?.[Number(selectedImage.index)]) return null;
+    if(owner.id !== node.id){
+        const belongsToGroup = node.type === 'smart-group'
+            && smartGroupImageRefs(node).some(ref => ref.nodeId === owner.id && Number(ref.index) === Number(selectedImage.index));
+        if(!belongsToGroup) return null;
+    }
+    return owner.images[Number(selectedImage.index)]?.generationMeta || null;
 }
 function activeSettingsSubject(){
     const active = activeComposerSubject?.id
@@ -1164,6 +1201,15 @@ function persistActiveSmartSettings(){
     if(!subject) return;
     subject.runSettings = settingsForStorage(settings);
     rememberRecentSmartSettings(settings, subject);
+}
+function restoreSmartSettingsAfterRun(runNode, previousSettings){
+    const selected = selectedNode();
+    const activeSubject = isSmartRunnableNode(selected) ? selected : activeSettingsSubject();
+    if(activeSubject?.id === runNode?.id || !activeSubject){
+        settings = previousSettings;
+        return;
+    }
+    settings = smartSettingsForNode(activeSubject);
 }
 function rememberCanvasListProject(projectId){
     const pid = projectId || 'default';
@@ -1640,6 +1686,7 @@ function mediaLayoutSize(img){
 }
 function copyMediaSizeFields(source, target={}){
     if(!source || typeof source !== 'object') return target;
+    if(source.batchCopyId) target.batchCopyId = source.batchCopyId;
     ['natural_w','natural_h','width','height','w','h','layout_w','layout_h'].forEach(key => {
         const n = Number(source[key]);
         if(Number.isFinite(n) && n > 0) target[key] = n;
@@ -2380,6 +2427,155 @@ function providerImageModels(providerId){
     if(providerId === 'volcengine') return volcengineProvider().image_models || [];
     return (apiProviders || []).find(p => p.id === providerId)?.image_models || [];
 }
+// Draw Things 的 provider 由用户在 API 设置中添加，使用 id/protocol 双重判断以兼容已有配置。
+function isDrawThingsProvider(providerId){
+    // 运行时配置尚未刷新时也要识别已保存的 Draw Things provider。
+    if(String(providerId || '').trim().toLowerCase() === 'drawthings') return true;
+    const provider = apiProviderById(providerId);
+    return String(provider?.id || '').trim().toLowerCase() === 'drawthings'
+        || String(provider?.protocol || '').trim().toLowerCase() === 'grpc';
+}
+function drawThingsModelSupportsEditing(model){
+    const normalized = String(model || '').trim().toLowerCase().replace(/-/g, '_');
+    if(normalized.includes('klein')) return true;
+    return normalized.includes('qwen') && normalized.includes('edit');
+}
+function drawThingsReferenceImagesForRequest(node, refs, runSettings){
+    const references = (refs || []).filter(ref => ref?.url);
+    // 非编辑模型也支持标准单图图生图；当前节点上一轮输出因此必须保留为
+    // 参考图，不能再被当成“编辑模型自引用”过滤掉。多图限制在提交前统一提示。
+    return references;
+}
+function drawThingsReferenceError(runSettings, refs){
+    if(!isDrawThingsProvider(runSettings?.provider_id)) return '';
+    if(drawThingsModelSupportsEditing(runSettings?.model)) return '';
+    return (refs || []).filter(ref => ref?.url).length > 1
+        ? tr('smart.errDrawThingsMultiImage')
+        : '';
+}
+function drawThingsRandomSeed(){
+    if(globalThis.crypto?.getRandomValues){
+        const values = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(values);
+        return Math.max(1, values[0] % 4294967295);
+    }
+    return Math.floor(Math.random() * 4294967295) + 1;
+}
+function drawThingsUniqueRandomSeed(usedSeeds){
+    let seed = drawThingsRandomSeed();
+    while(usedSeeds.has(seed)) seed = drawThingsRandomSeed();
+    usedSeeds.add(seed);
+    return seed;
+}
+function normalizeDrawThingsSeed(value){
+    const num = Number(value);
+    if(!Number.isFinite(num)) return drawThingsRandomSeed();
+    return Math.max(1, Math.min(4294967295, Math.floor(num)));
+}
+// 统一生成完整请求指纹；固定 seed 才允许复用，随机 seed 明确跳过缓存。
+const fixedSeedGenerationCache = new Map();
+function stableGenerationFingerprintValue(value){
+    if(Array.isArray(value)) return value.map(stableGenerationFingerprintValue);
+    if(value && typeof value === 'object'){
+        return Object.keys(value).sort().reduce((result, key) => {
+            result[key] = stableGenerationFingerprintValue(value[key]);
+            return result;
+        }, {});
+    }
+    return value;
+}
+function generationRequestFingerprint(payload, count, fixedSeedState){
+    if(!fixedSeedState || fixedSeedState.random) return '';
+    return JSON.stringify(stableGenerationFingerprintValue({
+        request:payload || {},
+        count:Number(count) || 1,
+        seed:fixedSeedState
+    }));
+}
+// 随机模式完成后也暂存本次结果；关闭骰子时可直接复用刚才这张图，而不是重复提交一次。
+function drawThingsSeedResultCacheKey(payload, seed){
+    return generationRequestFingerprint(payload, 1, {
+        provider:'drawthings',
+        seed:normalizeDrawThingsSeed(seed)
+    });
+}
+function drawThingsCachePayload(payload, options={}){
+    const selfReferenceNodeId = String(options.selfReferenceNodeId || '');
+    const selfReferenceUrls = new Set((options.selfReferenceUrls || []).map(drawThingsCacheUrlKey).filter(Boolean));
+    if(!Array.isArray(payload?.reference_images)) return payload;
+    const referenceImages = payload.reference_images.filter(ref => {
+        const sameNode = selfReferenceNodeId && String(ref?.nodeId || '') === selfReferenceNodeId;
+        const sameImage = selfReferenceUrls.has(drawThingsCacheUrlKey(ref?.url));
+        return !sameNode && !sameImage;
+    });
+    const stableReferences = referenceImages.map(ref => ({
+        url:drawThingsCacheUrlKey(ref?.url),
+        ...(Number.isFinite(Number(ref?.weight)) ? {weight:Number(ref.weight)} : {})
+    }));
+    return {...payload, reference_images:stableReferences};
+}
+function drawThingsCacheUrlKey(url){
+    const value = String(url || '').trim();
+    if(!value) return '';
+    try {
+        const parsed = new URL(value, globalThis.location?.href || 'http://localhost/');
+        parsed.search = '';
+        parsed.hash = '';
+        return parsed.href;
+    } catch(_err){
+        return value.split(/[?#]/, 1)[0];
+    }
+}
+function drawThingsCacheOptionsForNode(node){
+    return {
+        selfReferenceNodeId:node?.id,
+        selfReferenceUrls:(node?.images || []).map(img => img?.url).filter(Boolean)
+    };
+}
+function smartApiImageGenerationCount(runSettings){
+    return Math.max(1, Math.min(8, Number(runSettings?.count || 1)));
+}
+function smartApiImageTaskCount(runSettings){
+    if(isDrawThingsProvider(runSettings?.provider_id)){
+        return runSettings?.drawThingsSeedRandom !== false
+            ? smartApiImageGenerationCount(runSettings)
+            : 1;
+    }
+    return smartApiImageGenerationCount(runSettings);
+}
+function repeatFixedSeedBatchImages(urls, count){
+    const requestedCount = Math.max(1, Number(count) || 1);
+    if(requestedCount <= 1) return urls || [];
+    const source = resultMediaUrls(urls)[0];
+    if(!source) return urls || [];
+    return Array.from({length:requestedCount}, (_, index) => ({
+        ...(typeof source === 'string' ? {url:source} : source),
+        batchCopyId:`fixed-seed-${uid('batch-copy')}-${index + 1}`
+    }));
+}
+function generationSeedField(field){
+    const name = `${field?.id || ''} ${field?.input || ''} ${field?.name || ''} ${field?.fieldName || ''}`.toLowerCase();
+    return /(^|[^a-z])(seed|noise[_ -]?seed|random[_ -]?seed)([^a-z]|$)|种子|噪声/.test(name);
+}
+function fixedGenerationSeedState({fields=[], valueFor, randomEnabled, randomActive}){
+    const values = {};
+    let hasSeed = false;
+    let random = false;
+    (fields || []).forEach(field => {
+        if(!generationSeedField(field)) return;
+        hasSeed = true;
+        const id = field.id || field.fieldName || field.input || String(Object.keys(values).length);
+        if(randomEnabled?.(field) && randomActive?.(field)) random = true;
+        values[id] = valueFor ? valueFor(field) : undefined;
+    });
+    if(!hasSeed || random) return null;
+    return {fields:values};
+}
+function rememberFixedSeedGenerationResult(cacheKey, urls){
+    const outputs = resultMediaUrls(urls).filter(Boolean);
+    if(cacheKey && outputs.length) fixedSeedGenerationCache.set(cacheKey, outputs);
+}
+// 即梦 image_upscale 支持的放大分辨率（与后端 JIMENG_UPSCALE_RESOLUTIONS 保持一致）
 const JIMENG_UPSCALE_RESOLUTIONS = ['2k', '4k', '8k'];
 function isJimengProviderId(providerId){
     const id = String(providerId || '').trim().toLowerCase();
@@ -2771,6 +2967,12 @@ function renderApiParams(){
     if(!settings.provider_id || !providers.some(p => p.id === settings.provider_id)) settings.provider_id = providers[0]?.id || '';
     const models = filterJimengImageModels(providerImageModels(settings.provider_id));
     if(!settings.model || !models.includes(settings.model)) settings.model = models[0] || '';
+    if(isDrawThingsProvider(settings.provider_id)){
+        if(!Number.isFinite(Number(settings.drawThingsSeed)) || Number(settings.drawThingsSeed) < 1){
+            settings.drawThingsSeed = drawThingsRandomSeed();
+        }
+        if(settings.drawThingsSeedRandom === undefined) settings.drawThingsSeedRandom = true;
+    }
     // 切换平台/模型时保留用户已选的分辨率（记忆），normalizeApiSizeSettings 只会修正非法的 auto。
     normalizeApiSizeSettings('');
     const outpaintLocked = settings.outpaintResolutionLocked === true;
@@ -2780,6 +2982,7 @@ function renderApiParams(){
         ${renderSizePickerControl('', true)}
         ${renderQualityControl()}
         ${renderCountVisualControl()}
+        ${renderDrawThingsSeedControl()}
         ${isJimengProviderId(settings.provider_id) ? renderJimengUpscaleControl() : ''}
     `;
 }
@@ -3313,6 +3516,19 @@ function renderCountVisualControl(){
             <div class="count-grid">
                 ${[1,2,3,4,5,6,7,8].map(n => `<button type="button" class="count-cell ${n === value ? 'active' : ''}" data-smart-param="count" data-smart-value="${n}">${n}</button>`).join('')}
             </div>
+        </div>
+    </div>`;
+}
+function renderDrawThingsSeedControl(){
+    if(!isDrawThingsProvider(settings.provider_id) || settings.apiKind === 'video') return '';
+    const seed = normalizeDrawThingsSeed(settings.drawThingsSeed);
+    settings.drawThingsSeed = seed;
+    const active = settings.drawThingsSeedRandom !== false;
+    return `<div class="smart-control drawthings-seed-control">
+        <div class="num-with-dice" title="${escapeHtml(tr('smart.drawThingsSeed'))}">
+            <span class="num-label">${escapeHtml(tr('smart.drawThingsSeed'))}</span>
+            <input type="number" min="1" max="4294967295" step="1" data-drawthings-seed value="${escapeHtml(seed)}">
+            <button type="button" class="dice-btn ${active ? 'active' : ''}" data-drawthings-seed-random title="${escapeHtml(active ? tr('smart.diceOn') : tr('smart.diceOff'))}" aria-label="${escapeHtml(active ? tr('smart.diceOn') : tr('smart.diceOff'))}"><i data-lucide="dice-5"></i></button>
         </div>
     </div>`;
 }
@@ -3996,6 +4212,27 @@ function bindDynamicParams(){
             event?.stopPropagation?.();
             setDynamicSetting(input.dataset.param, input.value);
             if(input.dataset.param === 'videoDuration' && event?.type === 'change') renderDynamicParams();
+        };
+    });
+    // 智能画布的 Draw Things seed 沿用普通画布的随机开关语义，固定 seed 时批量任务共用输入值。
+    dynamicParams.querySelectorAll('[data-drawthings-seed]').forEach(input => {
+        input.onclick = event => event.stopPropagation();
+        input.oninput = input.onchange = event => {
+            event?.stopPropagation?.();
+            settings.drawThingsSeed = normalizeDrawThingsSeed(input.value);
+            input.value = String(settings.drawThingsSeed);
+            persistActiveSmartSettings();
+            scheduleSave();
+        };
+    });
+    dynamicParams.querySelectorAll('[data-drawthings-seed-random]').forEach(btn => {
+        btn.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            settings.drawThingsSeedRandom = !(settings.drawThingsSeedRandom !== false);
+            persistActiveSmartSettings();
+            renderDynamicParams();
+            scheduleSave();
         };
     });
     dynamicParams.querySelectorAll('[data-toggle-param]').forEach(btn => {
@@ -5003,16 +5240,17 @@ let connectionLayerRaf = 0;
 function mergeSmartImageLists(localImgs, remoteImgs){
     const out = [];
     const seen = new Set();
+    const keyFor = img => `${img?.url || ''}|${img?.batchCopyId || ''}`;
     (localImgs || []).forEach(img => {
-        const u = img && img.url;
-        if(u && seen.has(u)) return;
-        if(u) seen.add(u);
+        const key = keyFor(img);
+        if(img?.url && seen.has(key)) return;
+        if(img?.url) seen.add(key);
         out.push(img);
     });
     (remoteImgs || []).forEach(img => {
-        const u = img && img.url;
-        if(!u || seen.has(u)) return;
-        seen.add(u);
+        const key = keyFor(img);
+        if(!img?.url || seen.has(key)) return;
+        seen.add(key);
         out.push(img);
     });
     return out;
@@ -6364,7 +6602,7 @@ function imageForDisplay(img){
         originalLocalUrl:img.originalLocalUrl || localUrl
     };
 }
-function resultMediaUrls(result){
+function resultMediaUrls(result, preserveDuplicates=false){
     const urls = [];
     const add = value => {
         if(!value) return;
@@ -6381,6 +6619,7 @@ function resultMediaUrls(result){
                 const url = value.url || value.path || value.src || value.uri;
                 if(url){
                     const item = {url, kind:value.kind || value.type || value.mediaKind || '', name:value.name || value.filename || ''};
+                    if(value.batchCopyId) item.batchCopyId = value.batchCopyId;
                     ['natural_w','natural_h','width','height','w','h','layout_w','layout_h'].forEach(key => {
                         const n = Number(value[key]);
                         if(Number.isFinite(n) && n > 0) item[key] = n;
@@ -6394,14 +6633,25 @@ function resultMediaUrls(result){
     };
     add(result);
     ['image_items','media_items','items','outputs','videos','audios','texts','files','images','urls','data','result','output','url'].forEach(key => add(result?.[key]));
-    const seen = new Set();
+    const seenUrls = new Set();
+    const seenCopies = new Set();
     return urls.map(item => {
         const url = typeof item === 'string' ? item : item?.url || item?.path || '';
         if(!url) return null;
         return typeof item === 'object' ? {...item, url} : url;
     }).filter(item => {
         const url = typeof item === 'string' ? item : item?.url || '';
-        return url && !seen.has(url) && seen.add(url);
+        const batchCopyId = preserveDuplicates && typeof item === 'object' ? item?.batchCopyId || '' : '';
+        if(!url) return false;
+        if(batchCopyId){
+            if(seenCopies.has(batchCopyId)) return false;
+            seenCopies.add(batchCopyId);
+            seenUrls.add(url);
+            return true;
+        }
+        if(seenUrls.has(url)) return false;
+        seenUrls.add(url);
+        return true;
     });
 }
 function mediaKindForUrls(urls, fallback='image'){
@@ -11547,9 +11797,9 @@ function updateComposer(){
         if(!node) setPromptText('');
         return;
     }
-    // composer 只绑定节点本身：图片只是素材/结果，不携带提示词或参数状态。
+    // 默认仍按节点工作；选中某张生成图时，composer 会切换到该图的历史快照。
     const subject = node;
-    const composerKey = `${node.id}:node`;
+    const composerKey = `${node.id}:node:${selectedImage.nodeId || ''}:${Number(selectedImage.index ?? -1)}`;
     const switchedNode = lastComposerNodeId !== composerKey;
     if(switchedNode) savePromptDraftForCurrent();
     lastComposerNodeId = composerKey;
@@ -11557,7 +11807,9 @@ function updateComposer(){
     const hasPromptInput = promptInputNodesFor(node).length > 0;
     if(switchedNode){
         settings = smartSettingsForNode(subject);
-        loadPromptDraft(subject);
+        const selectedMeta = selectedImageGenerationMetaForNode(subject);
+        if(selectedMeta) loadNodePromptDraftToInput(subject);
+        else loadPromptDraft(subject);
     }
     setPromptInputLocked(false);
     syncCascadeRunButton(node);
@@ -13186,14 +13438,14 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
         return {
             prompt:`${tr('smart.refMapHeader')}\n${mapText}\n\n${tr('smart.refUserNeed')}\n${body}`,
             displayPrompt,
-            refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+            refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', nodeId:img.nodeId || '', imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
             mentioned:true
         };
     }
     return {
         prompt:body,
         displayPrompt,
-        refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+        refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', nodeId:img.nodeId || '', imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
         mentioned:false
     };
 }
@@ -13390,11 +13642,11 @@ function finalizePendingNode(pendingNode, urls, meta, kind='image'){
     if(!pendingNode) return;
     pendingNode = liveSmartNode(pendingNode);
     const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : kind === 'text' ? 'txt' : 'png';
-    const imgs = cleanHistoryImages(urls.map((item, i) => {
+    const imgs = attachImageGenerationMeta(cleanHistoryImages(urls.map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
         const itemKind = (typeof item === 'object' && item.kind) || kind;
         return copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true});
-    }).filter(img => img.url));
+    }).filter(img => img.url)), meta);
     pendingNode.images = imgs;
     markSmartNodeComplete(pendingNode, meta);
     pendingNode.outputKind = kind;
@@ -13773,7 +14025,8 @@ function cleanHistoryImages(images=[]){
     return nonPreviewOutputImages(images)
         .map(img => stripImageGenerationMeta({...img}))
         .filter(img => {
-            const key = `${img.kind || ''}|${img.url || ''}`;
+            const copyKey = img.batchCopyId ? `|${img.batchCopyId}` : '';
+            const key = `${img.kind || ''}|${img.url || ''}${copyKey}`;
             if(seen.has(key)) return false;
             seen.add(key);
             return true;
@@ -13844,7 +14097,7 @@ function replaceOutputsToNodeWithHistory(node, additions, kind='image', meta=nul
     node = liveSmartNode(node);
     const beforeRight = (Number(node.x) || 0) + nodeRect(node).width;
     const existing = cleanHistoryImages(node.images || []);
-    const next = cleanHistoryImages(additions);
+    const next = attachImageGenerationMeta(cleanHistoryImages(additions), meta);
     if(!next.length) return [];
     const history = existing.length ? ensureHistoryGroupForNode(node) : historyGroupForNode(node);
     if(history){
@@ -13875,9 +14128,9 @@ function appendOutputsToNode(node, additions, kind='image', options={}){
     node = liveSmartNode(node);
     const beforeRight = (Number(node.x) || 0) + nodeRect(node).width;
     const existing = cleanHistoryImages(node.images || []);
-    const seen = new Set(existing.map(img => `${img.kind || ''}|${img.url || ''}`));
-    const next = cleanHistoryImages(additions).filter(img => {
-        const key = `${img.kind || ''}|${img.url || ''}`;
+    const seen = new Set(existing.map(img => `${img.kind || ''}|${img.url || ''}|${img.batchCopyId || ''}`));
+    const next = attachImageGenerationMeta(cleanHistoryImages(additions), options.meta).filter(img => {
+        const key = `${img.kind || ''}|${img.url || ''}|${img.batchCopyId || ''}`;
         if(seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -13894,7 +14147,7 @@ function appendOutputsToNode(node, additions, kind='image', options={}){
     if(!skipShift) pushRightSideNodes(node, afterRight - beforeRight + 36);
     return next;
 }
-function appendLoopOutputsToNode(node, additions, kind='image', ctx=smartLoopContext){
+function appendLoopOutputsToNode(node, additions, kind='image', ctx=smartLoopContext, meta=null){
     if(!node || !additions?.length) return [];
     const runState = ctx?.runState;
     if(runState && !runState.loopAppendInitialized) runState.loopAppendInitialized = new Set();
@@ -13913,7 +14166,7 @@ function appendLoopOutputsToNode(node, additions, kind='image', ctx=smartLoopCon
         }
         node.images = [];
     }
-    return appendOutputsToNode(node, additions, kind, {skipShift:true});
+    return appendOutputsToNode(node, additions, kind, {skipShift:true, meta});
 }
 function syncCascadeRunButton(node=selectedNode()){
     if(!cascadeRunBtn) return;
@@ -13930,7 +14183,20 @@ function syncCascadeRunButton(node=selectedNode()){
     refreshIcons();
 }
 function loadNodePromptDraftToInput(node){
-    if(node?.promptDraftHtml) {
+    const selectedMeta = selectedImageGenerationMetaForNode(node);
+    const promptHtml = selectedMeta?.promptHtml;
+    const promptText = selectedMeta?.promptText || selectedMeta?.displayPrompt || selectedMeta?.prompt || '';
+    const promptRefs = selectedMeta?.promptRefs || [];
+    if(promptHtml){
+        const hasToken = String(promptHtml || '').includes('mention-image-token');
+        promptInput.innerHTML = hasToken
+            ? promptHtml
+            : (promptHtmlWithMentionTokens(promptText, promptRefs) || promptHtml);
+    } else if(selectedMeta){
+        const rebuiltSelected = promptHtmlWithMentionTokens(promptText, promptRefs);
+        if(rebuiltSelected) promptInput.innerHTML = rebuiltSelected;
+        else setPromptText(promptText);
+    } else if(node?.promptDraftHtml) {
         const hasToken = String(node.promptDraftHtml || '').includes('mention-image-token');
         promptInput.innerHTML = hasToken
             ? node.promptDraftHtml
@@ -14000,35 +14266,54 @@ async function generateUrlsForCurrentSettings(node, prompt, refs, runSettings=se
     const activeSettings = runSettings || settings;
     if(activeSettings.engine === 'comfy') return generateComfyUrlsWithSettings(activeSettings, prompt, refs);
     if(activeSettings.engine === 'runninghub' && runningHubSelectedModel(activeSettings)){
-        const taskResult = await runApiGeneration(prompt, refs, runningHubModelApiSettings(activeSettings));
+        const taskResult = await runApiGeneration(prompt, refs, runningHubModelApiSettings(activeSettings), drawThingsCacheOptionsForNode(node));
         const taskIds = Array.isArray(taskResult?.taskIds) ? taskResult.taskIds : [];
         if(taskIds.length){
-            const settled = await Promise.all(taskIds.map(taskId => pollSmartCanvasTask(taskId)));
-            const urls = settled.flatMap(result => resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result))).filter(Boolean);
-            return {urls, kind:mediaKindForUrls(urls, 'image')};
+            const settled = await Promise.all(taskIds.map(async taskId => {
+                const result = await pollSmartCanvasTask(taskId);
+                const sourceImages = resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result));
+                rememberFixedSeedGenerationResult(taskResult.randomSeedCacheKeys?.[taskId], sourceImages);
+                return repeatFixedSeedBatchImages(sourceImages, taskResult.repeatCount || 1);
+            }));
+            const urls = settled.flat().filter(Boolean);
+            return {urls, kind:mediaKindForUrls(urls, 'image'), seeds:taskResult.seeds || []};
         }
         const urls = resultMediaUrls(taskResult);
-        return {urls, kind:mediaKindForUrls(urls, 'image')};
+        return {urls, kind:mediaKindForUrls(urls, 'image'), seeds:taskResult.seeds || []};
     }
     if(isApiLikeEngine(activeSettings.engine) && activeSettings.apiKind === 'video'){
         return {urls:await runApiVideoGeneration(prompt, refs, activeSettings), kind:'video'};
     }
     if(isApiLikeEngine(activeSettings.engine)){
-        const taskResult = await runApiGeneration(prompt, refs, activeSettings);
+        const taskResult = await runApiGeneration(prompt, refs, activeSettings, drawThingsCacheOptionsForNode(node));
+        if(taskResult?.cachedImages?.length){
+            return {urls:taskResult.cachedImages, kind:'image', seeds:taskResult.seeds || [], cached:true, cacheKey:taskResult.cacheKey || ''};
+        }
         const taskIds = Array.isArray(taskResult?.taskIds) ? taskResult.taskIds : [];
         if(taskIds.length){
-            const settled = await Promise.all(taskIds.map(taskId => pollSmartCanvasTask(taskId)));
-            const urls = settled.flatMap(result => resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result))).filter(Boolean);
-            return {urls, kind:mediaKindForUrls(urls, 'image')};
+            const settled = await Promise.all(taskIds.map(async taskId => {
+                const result = await pollSmartCanvasTask(taskId);
+                const sourceImages = resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result));
+                rememberFixedSeedGenerationResult(taskResult.randomSeedCacheKeys?.[taskId], sourceImages);
+                return repeatFixedSeedBatchImages(sourceImages, taskResult.repeatCount || 1);
+            }));
+            const urls = settled.flat().filter(Boolean);
+            const sourceUrls = settled.flat().filter(Boolean);
+            rememberFixedSeedGenerationResult(taskResult.cacheKey, resultMediaUrls(sourceUrls));
+            return {urls, kind:mediaKindForUrls(urls, 'image'), seeds:taskResult.seeds || []};
         }
         const urls = resultMediaUrls(taskResult);
-        return {urls, kind:mediaKindForUrls(urls, 'image')};
+        return {urls, kind:mediaKindForUrls(urls, 'image'), seeds:taskResult.seeds || []};
     }
-    const urls = activeSettings.engine === 'runninghub'
+    const runningHubResult = activeSettings.engine === 'runninghub'
         ? await runRunningHubGeneration(prompt, refs, activeSettings)
         : activeSettings.engine === 'modelscope'
             ? await runModelscopeGeneration(prompt, refs, activeSettings)
             : [];
+    if(activeSettings.engine === 'runninghub' && !Array.isArray(runningHubResult)){
+        return {urls:runningHubResult.urls || [], kind:'image', cached:Boolean(runningHubResult.cached), cacheKey:runningHubResult.cacheKey || ''};
+    }
+    const urls = runningHubResult;
     return {urls, kind:mediaKindForUrls(urls, 'image')};
 }
 async function generateComfyUrlsWithSettings(runSettings, prompt, refs){
@@ -14081,10 +14366,23 @@ async function generateComfyUrlsWithSettings(runSettings, prompt, refs){
             values[field.id] = runSettings.comfyParams?.[field.id] ?? field.default;
         }
     });
-    const result = await runQueuedSmartComfyGenerate({prompt, workflow_json:workflowName, params:comfyParamsFromWorkflowValues(wf.config || {fields:[]}, values), type:'workflow-custom', client_id:smartClientId});
+    const params = comfyParamsFromWorkflowValues(wf.config || {fields:[]}, values);
+    const fixedSeedState = fixedGenerationSeedState({
+        fields:fields.filter(f => comfyFieldKind(f) === 'setting'),
+        valueFor:field => values[field.id],
+        randomEnabled:comfyRandomEnabledField,
+        randomActive:field => smartComfyRandomActiveFor(runSettings, field.id)
+    });
+    const cacheKey = generationRequestFingerprint({engine:'comfy', mode, workflow:workflowName, prompt, refs:allRefs, params}, 1, fixedSeedState);
+    if(cacheKey){
+        const cached = fixedSeedGenerationCache.get(cacheKey) || [];
+        if(cached.length) return {urls:cached.slice(), kind:'image', cached:true, cacheKey};
+    }
+    const result = await runQueuedSmartComfyGenerate({prompt, workflow_json:workflowName, params, type:'workflow-custom', client_id:smartClientId});
     const urls = resultMediaUrls(result);
     const fallbackKind = result.videos?.length ? 'video' : result.audios?.length ? 'audio' : result.texts?.length ? 'text' : 'image';
-    return {urls, kind:mediaKindForUrls(urls, fallbackKind)};
+    rememberFixedSeedGenerationResult(cacheKey, urls);
+    return {urls, kind:mediaKindForUrls(urls, fallbackKind), cacheKey};
 }
 async function runCascadeStepIntoNode(sourceNode, targetNode, inputRefs, ctx=smartLoopContext){
     const outputNode = targetNode || sourceNode;
@@ -14095,10 +14393,18 @@ async function runCascadeStepIntoNode(sourceNode, targetNode, inputRefs, ctx=sma
     settings = runSettings;
     const outpaintSize = validOutpaintSize(requestNode);
     const selfRefs = sourceNode?.type === 'smart-loop' ? [] : selfReferenceImagesForNode(sourceNode, false, ctx).filter(img => img?.url);
-    const sourceRefs = (selfRefs.length ? selfRefs : defaultReferenceImagesFor(requestNode, false, ctx)).filter(img => img?.url);
+    const defaultRefs = defaultReferenceImagesFor(requestNode, false, ctx);
+    const candidateRefs = selfRefs.length && drawThingsModelSupportsEditing(runSettings.model) ? selfRefs : defaultRefs;
+    const sourceRefs = drawThingsReferenceImagesForRequest(requestNode, candidateRefs, runSettings);
+    const fallbackRefs = drawThingsReferenceImagesForRequest(requestNode, inputRefs, runSettings);
     const refsForRequest = sourceRefs.length
         ? sourceRefs
-        : (inputRefs && inputRefs.length ? inputRefs : null);
+        : (fallbackRefs.length ? fallbackRefs : null);
+    const referenceError = drawThingsReferenceError(runSettings, refsForRequest);
+    if(referenceError){
+        settings = previousSettings;
+        throw new Error(referenceError);
+    }
     const request = buildPromptRequestForNode(
         requestNode,
         refsForRequest,
@@ -14146,19 +14452,24 @@ async function runCascadeStepIntoNode(sourceNode, targetNode, inputRefs, ctx=sma
     render();
     settings = previousSettings;
     try {
-        const result = await generateUrlsForCurrentSettings(outputNode, prompt, request.refs || [], runSettings);
+        const result = await generateUrlsForCurrentSettings(requestNode, prompt, request.refs || [], runSettings);
+        const appliedSeed = applyDrawThingsSeedResult(result, runSettings, previousSettings, meta, outputNode);
+        // 级联节点完成后会恢复这份旧快照；保留本次真实提交的 seed，避免它覆盖新值。
+        if(appliedSeed && targetPromptState.runSettings && isDrawThingsProvider(targetPromptState.runSettings.provider_id || runSettings.provider_id)){
+            targetPromptState.runSettings.drawThingsSeed = appliedSeed;
+        }
         if(!result.urls?.length) throw new Error(result.kind === 'video' ? tr('smart.errNoOutVideos') : tr('smart.errNoOutImages'));
         if(outpaintSize) delete requestNode.outpaintSize;
-        addSmartGenerationLog({run:{...runLog, kind:result.kind || logKind}, outputs:result.urls, runMs:nowMs() - runLogStart});
+        if(!result.cached) addSmartGenerationLog({run:{...runLog, kind:result.kind || logKind}, outputs:result.urls, runMs:nowMs() - runLogStart});
         const ext = result.kind === 'video' ? 'mp4' : result.kind === 'audio' ? 'mp3' : result.kind === 'text' ? 'txt' : 'png';
         const additions = result.urls.map((item, i) => {
             const url = typeof item === 'string' ? item : item?.url || '';
             return stripImageGenerationMeta(copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:(typeof item === 'object' && item.kind) || result.kind, generatedResult:true}));
         }).filter(item => item.url);
         if(ctx?.appendLoopOutputs) {
-            appendLoopOutputsToNode(outputNode, additions, result.kind, ctx);
+            appendLoopOutputsToNode(outputNode, additions, result.kind, ctx, meta);
         } else {
-            replaceOutputsToNodeWithHistory(outputNode, additions, result.kind, null, {skipShift:Boolean(ctx?.nodeId)});
+            replaceOutputsToNodeWithHistory(outputNode, additions, result.kind, meta, {skipShift:Boolean(ctx?.nodeId)});
         }
         outputNode.runPrompt = targetPromptState.runPrompt;
         outputNode.runModelPrompt = targetPromptState.runModelPrompt;
@@ -14215,7 +14526,7 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
         const runLog = smartRunSnapshot(rootNode, prompt, request.refs || [], logKind);
         const runLogStart = nowMs();
         const expectedCount = isApiLikeEngine(runSettings.engine) && runSettings.apiKind !== 'video'
-            ? Math.max(1, Math.min(8, Number(runSettings.count || 1)))
+            ? smartApiImageGenerationCount(runSettings)
             : 1;
         outputSlot.queued = false;
         outputSlot.running = true;
@@ -14233,7 +14544,12 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
         settings = previousSettings;
         let result;
         if(isApiLikeEngine(runSettings.engine) && runSettings.apiKind !== 'video'){
-            const taskResult = await runApiGeneration(prompt, request.refs || [], runSettings);
+            const taskResult = await runApiGeneration(prompt, request.refs || [], runSettings, drawThingsCacheOptionsForNode(rootNode));
+            applyDrawThingsSeedResult(taskResult, runSettings, previousSettings, meta, outputSlot);
+            if(taskResult?.cachedImages?.length){
+                // 循环节点也遵循固定 seed 的请求缓存，避免每一轮重复提交相同任务。
+                result = {urls:taskResult.cachedImages, kind:'image', cached:true};
+            } else {
             const taskIds = Array.isArray(taskResult?.taskIds) ? taskResult.taskIds : [];
             if(!taskIds.length) throw new Error(tr('smart.errRunFailed'));
             const existing = cleanHistoryImages(outputSlot.images || []);
@@ -14247,26 +14563,42 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
                 delete history.h;
                 outputSlot.images = [];
             }
-            outputSlot.pendingTasks = taskIds.map(taskId => ({taskId, kind:'image', providerId:taskResult.providerId, model:taskResult.model}));
-            outputSlot.pending = Math.max(taskIds.length, Number(outputSlot.pending || 0) || taskIds.length);
+            outputSlot.pendingTasks = taskIds.map(taskId => ({
+                taskId,
+                kind:'image',
+                providerId:taskResult.providerId,
+                model:taskResult.model,
+                seedCacheKey:taskResult.cacheKey || taskResult.randomSeedCacheKeys?.[taskId] || '',
+                repeatCount:taskResult.repeatCount || 1,
+                imageMeta:snapshotImageGenerationMeta(meta)
+            }));
+            outputSlot.pending = taskIds.length;
             outputSlot.running = false;
             render();
             scheduleSave();
             await saveCanvas();
-            await resumeSmartPendingNode(outputSlot, {run:runLog, runLogStart});
+            await resumeSmartPendingNode(outputSlot, {run:runLog, runLogStart, imageMeta:meta});
             if(outputSlot.jimengPending || smartRecoverableImageTask(outputSlot)){
                 outputSlot.queued = false;
                 return [];
             }
             result = {urls:(outputSlot.images || []).map(img => img?.url ? img : null).filter(Boolean), kind:'image'};
+            }
         } else {
             result = await generateUrlsForCurrentSettings(outputSlot, prompt, request.refs || [], runSettings);
         }
         if(!result.urls?.length) throw new Error(result.kind === 'video' ? tr('smart.errNoOutVideos') : tr('smart.errNoOutImages'));
         let additions;
-        if(isApiLikeEngine(runSettings.engine) && runSettings.apiKind !== 'video'){
+        const cachedAlreadyDisplayed = result.cached
+            && result.urls.every(item => {
+                const url = typeof item === 'string' ? item : item?.url || '';
+                return url && (outputSlot.images || []).some(img => img?.url === url);
+            });
+        if(isApiLikeEngine(runSettings.engine) && runSettings.apiKind !== 'video' && !result.cached){
             additions = (outputSlot.images || []).map(img => stripImageGenerationMeta({...img})).filter(img => img?.url);
             if(meta) attachRunMeta(outputSlot, meta);
+        } else if(cachedAlreadyDisplayed){
+            additions = [];
         } else {
             const ext = result.kind === 'video' ? 'mp4' : result.kind === 'audio' ? 'mp3' : result.kind === 'text' ? 'txt' : 'png';
             additions = result.urls.map((item, i) => {
@@ -14284,7 +14616,7 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
             runPath.states[edgeKey] = 'done';
             scheduleConnectionLayerRefresh();
         }
-        addSmartGenerationLog({run:{...runLog, kind:result.kind || logKind}, outputs:result.urls, runMs:nowMs() - runLogStart});
+        if(!result.cached) addSmartGenerationLog({run:{...runLog, kind:result.kind || logKind}, outputs:result.urls, runMs:nowMs() - runLogStart});
         return rememberRoundOutputs(ctx, outputSlot, additions);
     } catch(e) {
         if(handleJimengPendingSignal(outputSlot, e)){
@@ -14596,39 +14928,46 @@ async function runGeneration(){
     const prompt = request.prompt.trim();
     if(!node) return;
     if(smartNodeInFlight(node)) return;
-    const refs = request.refs;
+    const rawRefs = request.refs;
     const previousSettings = cloneSmartSettings(settings);
-    const runSettings = smartSettingsForNode(node);
+    const runSettings = cloneSmartSettings(smartSettingsForNode(node));
     settings = {...settings, ...cloneSmartSettings(runSettings || {})};
-    if(!prompt && smartRunNeedsPrompt(settings)){
-        settings = previousSettings;
+    const refs = drawThingsReferenceImagesForRequest(node, rawRefs, runSettings);
+    const referenceError = drawThingsReferenceError(runSettings, refs);
+    if(referenceError){
+        restoreSmartSettingsAfterRun(node, previousSettings);
+        toast(referenceError);
+        return;
+    }
+    if(!prompt && smartRunNeedsPrompt(runSettings)){
+        restoreSmartSettingsAfterRun(node, previousSettings);
         toast(tr('smart.toastNeedPrompt'));
         return;
     }
     const outpaintSize = node?.outpaintSize && Number(node.outpaintSize.width) > 0 && Number(node.outpaintSize.height) > 0
         ? {width:Math.round(Number(node.outpaintSize.width)), height:Math.round(Number(node.outpaintSize.height))}
         : null;
-    if(outpaintSize && isApiLikeEngine(settings.engine) && settings.apiKind !== 'video'){
-        settings = {
-            ...settings,
+    if(outpaintSize && isApiLikeEngine(runSettings.engine) && runSettings.apiKind !== 'video'){
+        Object.assign(runSettings, {
             resolution:'custom',
             ratio:'',
             customWidth:outpaintSize.width,
             customHeight:outpaintSize.height,
             customSize:`${outpaintSize.width}x${outpaintSize.height}`
-        };
+        });
+        settings = {...settings, ...cloneSmartSettings(runSettings)};
     }
     const meta = snapshotRunMeta(prompt, node.id, request.displayPrompt, refs);
-    const logKind = isApiLikeEngine(settings.engine) && settings.apiKind === 'video' ? 'video' : 'image';
+    const logKind = isApiLikeEngine(runSettings.engine) && runSettings.apiKind === 'video' ? 'video' : 'image';
     const runLog = smartRunSnapshot(node, prompt, refs, logKind);
-    rememberRecentSmartSettings(settings, node);
+    rememberRecentSmartSettings(runSettings, node);
     const runLogStart = nowMs();
-    const expectedCount = settings.engine === 'runninghub'
+    const expectedCount = runSettings.engine === 'runninghub'
         ? 1
-        : settings.engine === 'comfy'
-        ? (settings.comfyMode === 'text' || settings.comfyMode === 'enhance' || settings.comfyMode === 'edit' || settings.comfyMode === 'custom' ? 1 : 1)
-        : Math.max(1, Math.min(8, Number(settings.count || 1)));
-    const apiConcurrentRun = isApiLikeEngine(settings.engine) || settings.engine === 'runninghub' || settings.engine === 'modelscope' || settings.engine === 'comfy';
+        : runSettings.engine === 'comfy'
+        ? (runSettings.comfyMode === 'text' || runSettings.comfyMode === 'enhance' || runSettings.comfyMode === 'edit' || runSettings.comfyMode === 'custom' ? 1 : 1)
+        : smartApiImageGenerationCount(runSettings);
+    const apiConcurrentRun = isApiLikeEngine(runSettings.engine) || runSettings.engine === 'runninghub' || runSettings.engine === 'modelscope' || runSettings.engine === 'comfy';
     const nodeHasImages = isSmartGroupNode(node) ? imagesForNode(node).some(img => img?.url) : (node.images || []).some(img => img?.url);
     const workflowModeRun = smartImageUsesWorkflowInput(node, smartLoopContext);
     const sourceVisualState = isSmartImageNode(node) && nodeHasImages && !workflowModeRun ? {
@@ -14670,57 +15009,98 @@ async function runGeneration(){
     }
     render();
     try {
-        if(settings.engine === 'comfy'){
-            await runComfyGeneration(pendingNode, prompt, refs, pendingNode, pendingMeta);
+        if(runSettings.engine === 'comfy'){
+            await runComfyGeneration(pendingNode, prompt, refs, pendingNode, pendingMeta, runSettings);
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             addSmartGenerationLog({run:runLog, outputs:pendingNode.images || [], runMs:nowMs() - runLogStart});
-            settings = previousSettings;
+            restoreSmartSettingsAfterRun(node, previousSettings);
             return;
         }
-        if(isApiLikeEngine(settings.engine) && settings.apiKind === 'video'){
-            const outVideos = await runApiVideoGeneration(prompt, refs);
+        if(isApiLikeEngine(runSettings.engine) && runSettings.apiKind === 'video'){
+            const outVideos = await runApiVideoGeneration(prompt, refs, runSettings);
             if(!outVideos.length) throw new Error(tr('smart.errNoOutVideos'));
             finalizePendingNode(pendingNode, outVideos, pendingMeta, 'video');
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             addSmartGenerationLog({run:runLog, outputs:outVideos, runMs:nowMs() - runLogStart});
             clearPromptInput({preserveDraft:true});
-            settings = previousSettings;
+            restoreSmartSettingsAfterRun(node, previousSettings);
             scheduleSave();
             return;
         }
-        const rhModelMode = settings.engine === 'runninghub' && Boolean(runningHubSelectedModel(settings));
-        const outImages = rhModelMode
-            ? await runApiGeneration(prompt, refs, runningHubModelApiSettings(settings))
-            : settings.engine === 'runninghub'
-                ? await runRunningHubGeneration(prompt, refs)
-                : settings.engine === 'modelscope'
-                ? await runModelscopeGeneration(prompt, refs)
-                : await runApiGeneration(prompt, refs);
-        if(isApiLikeEngine(settings.engine) || rhModelMode){
+        const rhModelMode = runSettings.engine === 'runninghub' && Boolean(runningHubSelectedModel(runSettings));
+        const rawOutImages = rhModelMode
+            ? await runApiGeneration(prompt, refs, runningHubModelApiSettings(runSettings), drawThingsCacheOptionsForNode(node))
+            : runSettings.engine === 'runninghub'
+                ? await runRunningHubGeneration(prompt, refs, runSettings)
+                : runSettings.engine === 'modelscope'
+                ? await runModelscopeGeneration(prompt, refs, runSettings)
+                : await runApiGeneration(prompt, refs, runSettings, drawThingsCacheOptionsForNode(node));
+        const outImages = rawOutImages;
+        applyDrawThingsSeedResult(outImages, runSettings, previousSettings, pendingMeta, pendingNode);
+        if(outImages?.cachedImages?.length){
+            // 固定 seed 命中缓存时仍更新当前节点的结果快照，但不新增生成日志或后端任务。
+            finalizePendingNode(pendingNode, outImages.cachedImages, pendingMeta);
+            if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
+            clearPromptInput({preserveDraft:true});
+            restoreSmartSettingsAfterRun(node, previousSettings);
+            scheduleSave();
+            return;
+        }
+        if(runSettings.engine === 'runninghub' && !rhModelMode && outImages?.cached){
+            // RunningHub 命中固定 seed 指纹时只恢复结果，不新增一次生成日志。
+            finalizePendingNode(pendingNode, outImages.urls || [], pendingMeta);
+            if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
+            clearPromptInput({preserveDraft:true});
+            restoreSmartSettingsAfterRun(node, previousSettings);
+            scheduleSave();
+            return;
+        }
+        if(isApiLikeEngine(runSettings.engine) || rhModelMode){
             const taskIds = Array.isArray(outImages?.taskIds) ? outImages.taskIds : [];
             if(!taskIds.length) throw new Error(tr('smart.errRunFailed'));
-            pendingNode.pendingTasks = taskIds.map(taskId => ({taskId, kind:'image', providerId:outImages.providerId, model:outImages.model}));
-            pendingNode.pending = Math.max(taskIds.length, Number(pendingNode.pending || 0) || taskIds.length);
+            pendingNode.pendingTasks = taskIds.map(taskId => ({
+                taskId,
+                kind:'image',
+                providerId:outImages.providerId,
+                model:outImages.model,
+                seedCacheKey:outImages.cacheKey || outImages.randomSeedCacheKeys?.[taskId] || '',
+                repeatCount:outImages.repeatCount || 1,
+                imageMeta:snapshotImageGenerationMeta(pendingMeta)
+            }));
+            pendingNode.pending = taskIds.length;
             pendingNode.runStartedAt = nowMs();
             pendingNode.runTimerHidden = false;
             pendingNode.running = false;
             render();
             scheduleSave();
             await saveCanvas();
-            await resumeSmartPendingNode(pendingNode, {run:runLog, runLogStart});
+            await resumeSmartPendingNode(pendingNode, {run:runLog, runLogStart, imageMeta:pendingMeta});
             if(pendingNode.jimengPending || smartRecoverableImageTask(pendingNode)){
                 if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
                 clearPromptInput({preserveDraft:true});
-                settings = previousSettings;
+                restoreSmartSettingsAfterRun(node, previousSettings);
                 scheduleSave();
                 return;
             }
             if(!(pendingNode.images || []).length) throw new Error(tr('smart.errNoOutImages'));
+            rememberFixedSeedGenerationResult(outImages.cacheKey, pendingNode.images || []);
             if(outpaintSize) delete node.outpaintSize;
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             addSmartGenerationLog({run:runLog, outputs:pendingNode.images || [], runMs:nowMs() - runLogStart});
             clearPromptInput({preserveDraft:true});
-            settings = previousSettings;
+            restoreSmartSettingsAfterRun(node, previousSettings);
+            scheduleSave();
+            return;
+        }
+        if(runSettings.engine === 'runninghub' && !rhModelMode){
+            const urls = outImages?.urls || [];
+            if(!urls.length) throw new Error(tr('smart.errNoOutImages'));
+            if(outpaintSize) delete node.outpaintSize;
+            finalizePendingNode(pendingNode, urls, pendingMeta);
+            if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
+            addSmartGenerationLog({run:runLog, outputs:urls, runMs:nowMs() - runLogStart});
+            clearPromptInput({preserveDraft:true});
+            restoreSmartSettingsAfterRun(node, previousSettings);
             scheduleSave();
             return;
         }
@@ -14730,10 +15110,10 @@ async function runGeneration(){
         if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
         addSmartGenerationLog({run:runLog, outputs:outImages, runMs:nowMs() - runLogStart});
         clearPromptInput({preserveDraft:true});
-        settings = previousSettings;
+        restoreSmartSettingsAfterRun(node, previousSettings);
         scheduleSave();
     } catch(e) {
-        settings = previousSettings;
+        restoreSmartSettingsAfterRun(node, previousSettings);
         if(handleJimengPendingSignal(pendingNode, e)){
             if(sourceVisualState) restoreSourceVisualState(node, sourceVisualState);
             delete pendingNode._runMetaTargetId;
@@ -14814,15 +15194,118 @@ function comfyFieldKind(field){
     if(field?.type === 'textarea' || /prompt|text|提示词|正向|负向/.test(key)) return 'prompt';
     return 'setting';
 }
-async function runApiGeneration(prompt, refs, runSettings=settings){
+function applyDrawThingsSeedResult(taskResult, runSettings=settings, restoreSettings=null, meta=null, targetNode=null){
+    if(!isDrawThingsProvider(runSettings?.provider_id)) return 0;
+    const seeds = Array.isArray(taskResult?.seeds) ? taskResult.seeds : [];
+    if(!seeds.length) return 0;
+    const randomMode = runSettings.drawThingsSeedRandom !== false;
+    // 批量任务各自使用独立 seed；历史快照必须记录本批次最后一次实际提交的 seed。
+    const actualSeed = normalizeDrawThingsSeed(seeds[seeds.length - 1]);
+    if(meta?.settings){
+        meta.settings.drawThingsSeed = actualSeed;
+        // 快照同时保存开关状态，避免随机结果被误读成固定 seed 设置。
+        meta.settings.drawThingsSeedRandom = randomMode;
+    }
+
+    // 固定模式的 seed 是用户输入，不能被任务结果回写；否则后续指纹会被悄悄改变。
+    // 随机模式则把本次实际 seed 显示出来，但保留随机开关，下一次仍会重新取 seed。
+    if(!randomMode) return normalizeDrawThingsSeed(runSettings.drawThingsSeed);
+    runSettings.drawThingsSeed = actualSeed;
+    if(restoreSettings && isDrawThingsProvider(restoreSettings.provider_id)) restoreSettings.drawThingsSeed = actualSeed;
+
+    // 优先写入本次任务的目标节点；级联运行时当前选中节点可能已经变化，不能依赖全局选择状态。
+    const subjects = [targetNode].filter(Boolean);
+    const seen = new Set();
+    subjects.forEach(subject => {
+        if(seen.has(subject.id) || !isDrawThingsProvider(subject.runSettings?.provider_id || runSettings.provider_id)) return;
+        seen.add(subject.id);
+        subject.runSettings = settingsForStorage({...settingsForStorage(subject.runSettings || {}), drawThingsSeed:actualSeed, drawThingsSeedRandom:true});
+    });
+
+    // 只有用户仍选中本次运行目标时才刷新输入框，避免后台任务覆盖其他节点的参数。
+    const activeSubject = activeSettingsSubject();
+    if(targetNode?.id && activeSubject?.id === targetNode.id
+        && isDrawThingsProvider(settings?.provider_id)
+        && String(settings.provider_id) === String(runSettings.provider_id)){
+        settings.drawThingsSeed = actualSeed;
+        dynamicParams?.querySelectorAll('[data-drawthings-seed]').forEach(input => {
+            input.value = String(actualSeed);
+        });
+        // 强制重建控件，确保后续 composer/render 不会从缓存的旧 DOM 值恢复。
+        renderDynamicParams({force:true});
+        persistActiveSmartSettings();
+        scheduleSave();
+    }
+    return actualSeed;
+}
+async function runApiGeneration(prompt, refs, runSettings=settings, cacheOptions={}){
     if(!runSettings.provider_id || !runSettings.model) throw new Error(tr('smart.errNoApiModel'));
-    const count = Math.max(1, Math.min(8, Number(runSettings.count || 1)));
-    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), quality:runSettings.quality || 'auto', n:1, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX)};
-    const tasks = await Promise.all(Array.from({length:count}, () => fetch('/api/canvas-image-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(async r => {
+    const requestedCount = smartApiImageGenerationCount(runSettings);
+    const drawThingsSelected = isDrawThingsProvider(runSettings.provider_id);
+    const count = smartApiImageTaskCount(runSettings);
+    const drawThingsBatchSize = 1;
+    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:runSettings.ratio === 'custom' ? (runSettings.customRatio || '') : (runSettings.ratio || ''), resolution:runSettings.resolution || '', quality:runSettings.quality || 'auto', n:1, batch_size:drawThingsBatchSize, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX)};
+    const cachePayload = drawThingsSelected ? drawThingsCachePayload(payload, cacheOptions) : payload;
+    const fixedSeedState = drawThingsSelected && runSettings.drawThingsSeedRandom === false
+        ? {provider:'drawthings', seed:normalizeDrawThingsSeed(runSettings.drawThingsSeed)}
+        : null;
+    const fixedSeedCacheKey = generationRequestFingerprint(cachePayload, 1, fixedSeedState);
+    if(fixedSeedCacheKey){
+        const cached = fixedSeedGenerationCache.get(fixedSeedCacheKey) || [];
+        if(cached.length){
+            // 固定 seed 的完全相同请求直接复用结果，不再创建新的后端任务。
+            toast('检测到 seed 值（种子数）相同，跳过生成');
+            return {
+                cachedImages:repeatFixedSeedBatchImages(cached, requestedCount),
+                count:requestedCount,
+                taskCount:count,
+                repeatCount:fixedSeedState ? requestedCount : 1,
+                providerId:payload.provider_id,
+                model:payload.model,
+                // 缓存命中时沿用指纹中的固定 seed，避免引用不存在的临时变量。
+                seeds:Array.from({length:requestedCount}, () => fixedSeedState.seed),
+                cacheKey:fixedSeedCacheKey,
+                cached:true
+            };
+        }
+    }
+    const seeds = [];
+    const usedSeeds = new Set();
+    const tasks = await Promise.all(Array.from({length:count}, () => {
+        const requestPayload = {...payload};
+        if(drawThingsSelected){
+            const seed = runSettings.drawThingsSeedRandom !== false
+                ? drawThingsUniqueRandomSeed(usedSeeds)
+                : normalizeDrawThingsSeed(runSettings.drawThingsSeed);
+            seeds.push(seed);
+            requestPayload.seed = seed;
+        }
+        return fetch('/api/canvas-image-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(requestPayload)}).then(async r => {
         if(!r.ok) throw new Error(await r.text());
         return r.json();
-    })));
-    return {taskIds:tasks.map(task => task.task_id).filter(Boolean), count, providerId:payload.provider_id, model:payload.model};
+        });
+    }));
+    const taskIds = tasks.map(task => task.task_id).filter(Boolean);
+    const randomSeedCacheKeys = {};
+    if(drawThingsSelected && runSettings.drawThingsSeedRandom !== false){
+        tasks.forEach((task, index) => {
+            if(task?.task_id && seeds[index] !== undefined){
+                randomSeedCacheKeys[task.task_id] = drawThingsSeedResultCacheKey(cachePayload, seeds[index]);
+            }
+        });
+    }
+    // 返回实际提交的 seed，调用层据此更新前端显示和本次生成的参数快照。
+    return {
+        taskIds,
+        count:requestedCount,
+        taskCount:count,
+        repeatCount:fixedSeedState ? requestedCount : 1,
+        providerId:payload.provider_id,
+        model:payload.model,
+        seeds,
+        cacheKey:fixedSeedCacheKey,
+        randomSeedCacheKeys
+    };
 }
 async function runRunningHubGeneration(prompt, refs, runSettings=settings){
     const ref = selectedRunningHubRef(runSettings);
@@ -14838,6 +15321,17 @@ async function runRunningHubGeneration(prompt, refs, runSettings=settings){
     const body = mode === 'workflow'
         ? {workflowId:ref.id, nodeInfoList, useWallet:runSettings.rhPayment === 'wallet', ...workflowExtras}
         : {webappId:ref.id, nodeInfoList, instanceType:runSettings.rhInstanceType || '', useWallet:runSettings.rhPayment === 'wallet'};
+    const fixedSeedState = fixedGenerationSeedState({
+        fields,
+        valueFor:field => nodeInfoList.find(item => rhParamKey(item.nodeId, item.fieldName) === rhParamKey(field.nodeId, field.fieldName))?.fieldValue,
+        randomEnabled:rhRandomEnabled,
+        randomActive:field => smartRhRandomActiveFor(runSettings, rhParamKey(field.nodeId, field.fieldName))
+    });
+    const cacheKey = generationRequestFingerprint({engine:'runninghub', mode, body}, 1, fixedSeedState);
+    if(cacheKey){
+        const cached = fixedSeedGenerationCache.get(cacheKey) || [];
+        if(cached.length) return {urls:cached.slice(), cached:true, cacheKey};
+    }
     const submit = await fetch(endpoint, {
         method:'POST',
         headers:{'Content-Type':'application/json'},
@@ -14860,7 +15354,8 @@ async function runRunningHubGeneration(prompt, refs, runSettings=settings){
         if(data.status === 'SUCCESS'){
             const urls = resultMediaUrls(data.image_items?.length ? data.image_items : (data.urls || []));
             if(!urls.length) throw new Error(tr('smart.rhOutputsEmpty'));
-            return urls;
+            rememberFixedSeedGenerationResult(cacheKey, urls);
+            return {urls, cacheKey};
         }
         if(data.status === 'FAILED') throw new Error(data.failReason || tr('smart.rhFailed'));
     }
@@ -14968,14 +15463,44 @@ async function urlToBase64(url){
     });
 }
 function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
-async function runComfyGeneration(node, prompt, refs, pendingNode, meta){
+// 探测媒体时长（秒）；用于即梦音频 2–15s 校验。加载失败/超时返回 null（放行，不误伤）。
+function probeMediaDuration(url, kind='audio'){
+    return new Promise(resolve => {
+        if(!url){ resolve(null); return; }
+        let done = false;
+        const finish = value => { if(done) return; done = true; try { el.src = ''; } catch(e){} resolve(value); };
+        let el;
+        try {
+            el = document.createElement(kind === 'video' ? 'video' : 'audio');
+        } catch(e){ resolve(null); return; }
+        el.preload = 'metadata';
+        el.onloadedmetadata = () => { const d = Number(el.duration); finish(Number.isFinite(d) && d > 0 ? d : null); };
+        el.onerror = () => finish(null);
+        setTimeout(() => finish(null), 8000);
+        try { el.src = url; } catch(e){ finish(null); }
+    });
+}
+async function runSmartComfyUpscale(imageUrl, resolution){
+    if(!imageUrl) throw new Error(tr('smart.errRunFailed'));
+    const inputName = await comfyNameForRef({url:imageUrl, name:'smart-upscale-input.png'});
+    return runQueuedSmartComfyGenerate({
+        workflow_json:'upscale.json',
+        params:{
+            "15":{image:inputName},
+            "172":{seed:Math.floor(Math.random() * 4294967295), resolution:Number(resolution || 2048)}
+        },
+        type:'enhance',
+        client_id:smartClientId
+    });
+}
+async function runComfyGeneration(node, prompt, refs, pendingNode, meta, runSettings=settings){
     const allRefs = refs || [];
     refs = imageRefsOnly(allRefs);
-    const mode = settings.comfyMode || 'text';
-    if(mode === 'text') return runComfyText(node, prompt, pendingNode, meta);
-    if(mode === 'enhance') return runComfyEnhance(node, refs, pendingNode, meta);
-    if(mode === 'edit') return runComfyEdit(node, prompt, refs, pendingNode, meta);
-    const workflowName = settings.comfyWorkflow || comfyWorkflows[0]?.name || '';
+    const mode = runSettings.comfyMode || 'text';
+    if(mode === 'text') return runComfyText(node, prompt, pendingNode, meta, runSettings);
+    if(mode === 'enhance') return runComfyEnhance(node, refs, pendingNode, meta, runSettings);
+    if(mode === 'edit') return runComfyEdit(node, prompt, refs, pendingNode, meta, runSettings);
+    const workflowName = runSettings.comfyWorkflow || comfyWorkflows[0]?.name || '';
     if(!workflowName) throw new Error(tr('smart.errNeedWorkflow'));
     const wf = await fetch(`/api/workflows/${encodeURIComponent(workflowName)}`).then(async r => {
         if(!r.ok) throw new Error(await r.text());
@@ -14995,13 +15520,29 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta){
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'video'), videoRefsOnly(allRefs));
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'audio'), audioRefsOnly(allRefs));
     fields.filter(f => comfyFieldKind(f) === 'setting').forEach(field => {
-        if(comfyRandomEnabledField(field) && smartComfyRandomActive(field.id)){
+        if(comfyRandomEnabledField(field) && smartComfyRandomActiveFor(runSettings, field.id)){
             values[field.id] = smartComfyRandomValue(field);
         } else {
-            values[field.id] = settings.comfyParams?.[field.id] ?? field.default;
+            values[field.id] = runSettings.comfyParams?.[field.id] ?? field.default;
         }
     });
-    const result = await runQueuedSmartComfyGenerate({prompt, workflow_json:workflowName, params:comfyParamsFromWorkflowValues(wf.config || {fields:[]}, values), type:'workflow-custom', client_id:smartClientId});
+    const params = comfyParamsFromWorkflowValues(wf.config || {fields:[]}, values);
+    const fixedSeedState = fixedGenerationSeedState({
+        fields:fields.filter(f => comfyFieldKind(f) === 'setting'),
+        valueFor:field => values[field.id],
+        randomEnabled:comfyRandomEnabledField,
+        randomActive:field => smartComfyRandomActive(field.id)
+    });
+    const cacheKey = generationRequestFingerprint({engine:'comfy', mode, workflow:workflowName, prompt, refs:allRefs, params}, 1, fixedSeedState);
+    const cached = cacheKey ? fixedSeedGenerationCache.get(cacheKey) || [] : [];
+    if(cached.length){
+        // 直接运行路径与级联路径共用完整 seed 指纹，固定输入命中时不再提交 Comfy 任务。
+        if(pendingNode) finalizePendingNode(pendingNode, cached, meta, 'image');
+        clearPromptInput({preserveDraft:true});
+        scheduleSave();
+        return;
+    }
+    const result = await runQueuedSmartComfyGenerate({prompt, workflow_json:workflowName, params, type:'workflow-custom', client_id:smartClientId});
     const urls = resultMediaUrls(result);
     if(!urls.length) throw new Error(tr('smart.errComfyNoImages'));
     const kind = mediaKindForUrls(urls, result.videos?.length ? 'video' : result.audios?.length ? 'audio' : result.texts?.length ? 'text' : 'image');
@@ -15009,6 +15550,7 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta){
     const out = urls.map((url, i) => ({url, name:`comfy-${i + 1}.${ext}`, kind})).filter(x => x.url);
     if(!out.length) throw new Error(tr('smart.errComfyEmpty'));
     const outputUrls = out.map(o => o.url);
+    rememberFixedSeedGenerationResult(cacheKey, outputUrls);
     if(pendingNode){
         finalizePendingNode(pendingNode, outputUrls, meta, kind);
     } else {
@@ -15019,8 +15561,8 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta){
     clearPromptInput({preserveDraft:true});
     scheduleSave();
 }
-async function runComfyText(node, prompt, pendingNode, meta){
-    const data = await runQueuedSmartComfyGenerate({prompt, width:Number(settings.width || 1024), height:Number(settings.height || 1024), workflow_json:'Z-Image.json', type:'zimage', client_id:smartClientId});
+async function runComfyText(node, prompt, pendingNode, meta, runSettings=settings){
+    const data = await runQueuedSmartComfyGenerate({prompt, width:Number(runSettings.width || 1024), height:Number(runSettings.height || 1024), workflow_json:'Z-Image.json', type:'zimage', client_id:smartClientId});
     const out = data.outputs || data.images || [];
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
     if(pendingNode){
@@ -15033,11 +15575,16 @@ async function runComfyText(node, prompt, pendingNode, meta){
     clearPromptInput({preserveDraft:true});
     scheduleSave();
 }
-async function runComfyEnhance(node, refs, pendingNode, meta){
+async function runComfyEnhance(node, refs, pendingNode, meta, runSettings=settings){
     if(!refs.length) throw new Error(tr('smart.errEnhanceNeedRefs'));
     const inputName = await comfyNameForRef(refs[0]);
-    const data = await runQueuedSmartComfyGenerate({workflow_json:'Z-Image-Enhance.json', type:'enhance', params:{"15":{image:inputName},"204":{value:Number(settings.enhanceStrength ?? 0.5)}}, client_id:smartClientId});
-    const out = data.outputs || data.images || [];
+    const data = await runQueuedSmartComfyGenerate({workflow_json:'Z-Image-Enhance.json', type:'enhance', params:{"15":{image:inputName},"204":{value:Number(runSettings.enhanceStrength ?? 0.5)}}, client_id:smartClientId});
+    //修复超分勾选
+    let out = data.outputs || data.images || [];
+    if(runSettings.enhanceUpscale && out[0]){
+        const upscale = await runSmartComfyUpscale(out[0], runSettings.enhanceUpscaleRes || 2048);
+        out = upscale.outputs || upscale.images || [];
+    }
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
     if(pendingNode){
         finalizePendingNode(pendingNode, out, meta);
@@ -15048,12 +15595,17 @@ async function runComfyEnhance(node, refs, pendingNode, meta){
     }
     scheduleSave();
 }
-async function runComfyEdit(node, prompt, refs, pendingNode, meta){
+async function runComfyEdit(node, prompt, refs, pendingNode, meta, runSettings=settings){
     if(!refs.length) throw new Error(tr('smart.errEditNeedRefs'));
     const names = [];
     for(const ref of refs.slice(0, 3)) names.push(await comfyNameForRef(ref));
     const data = await runQueuedSmartComfyGenerate({prompt, workflow_json:'Flux2-Klein.json', type:'klein', params:{"168":{text:prompt},"158":{noise_seed:Math.floor(Math.random()*1000000)},"278":{image:names[0] || ""},"270":{image:names[1] || ""},"292":{image:names[2] || ""},"313":{value:Boolean(names[1])},"314":{value:Boolean(names[2])}}, client_id:smartClientId});
-    const out = data.outputs || data.images || [];
+    //修复超分勾选
+    let out = data.outputs || data.images || [];
+    if(runSettings.editUpscale && out[0]){
+        const upscale = await runSmartComfyUpscale(out[0], runSettings.editUpscaleRes || 2048);
+        out = upscale.outputs || upscale.images || [];
+    }
     if(!out.length) throw new Error(tr('smart.errComfyNoImages'));
     if(pendingNode){
         finalizePendingNode(pendingNode, out, meta);
@@ -15252,7 +15804,10 @@ async function querySmartImageTaskNow(nodeId, localTaskId){
         if(data.status === 'succeeded'){
             task.failed = false;
             task.querying = false;
-            finalizeSmartPendingTask(node, task.taskId, resultMediaUrls(data.image_items?.length ? data.image_items : (data.images?.length ? data.images : data)), task.kind || 'image');
+            const sourceImages = resultMediaUrls(data.image_items?.length ? data.image_items : (data.images?.length ? data.images : data));
+            rememberFixedSeedGenerationResult(task.seedCacheKey, sourceImages);
+            const images = repeatFixedSeedBatchImages(sourceImages, task.repeatCount || 1);
+            finalizeSmartPendingTask(node, task.taskId, images, task.kind || 'image');
             render();
             scheduleSave();
             return;
@@ -15334,20 +15889,20 @@ async function pollSmartCanvasTask(taskId){
         activeSmartTaskPolls.delete(taskId);
     }
 }
-function finalizeSmartPendingTask(node, taskId, images, kind='image'){
+function finalizeSmartPendingTask(node, taskId, images, kind='image', meta=null){
     if(!node || !taskId) return;
     node.pendingTasks = smartPendingTasks(node).filter(task => task.taskId !== taskId);
     node.pending = Math.max(0, Number(node.pending || 0) - 1);
     const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : kind === 'text' ? 'txt' : 'png';
-    const mediaItems = resultMediaUrls(images);
+    const mediaItems = resultMediaUrls(images, true);
     const existing = cleanHistoryImages(node.images || []);
-    const seen = new Set(existing.map(img => `${img.kind || ''}|${img.url || ''}`));
-    const additions = cleanHistoryImages((mediaItems || []).map((item, i) => {
+    const seen = new Set(existing.map(img => `${img.kind || ''}|${img.url || ''}|${img.batchCopyId || ''}`));
+    const additions = attachImageGenerationMeta(cleanHistoryImages((mediaItems || []).map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
         const itemKind = (typeof item === 'object' && item.kind) || kind;
         return stripImageGenerationMeta(copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true}));
-    }).filter(item => item.url)).filter(item => {
-        const key = `${item.kind || ''}|${item.url || ''}`;
+    }).filter(item => item.url)), meta).filter(item => {
+        const key = `${item.kind || ''}|${item.url || ''}|${item.batchCopyId || ''}`;
         if(seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -15381,7 +15936,7 @@ async function resumeSmartPendingNode(node, logContext={}){
             error:message
         });
     };
-    node.pending = Math.max(tasks.length, Number(node.pending || 0) || tasks.length);
+    node.pending = tasks.length;
     node.running = false;
     render();
     const failures = [];
@@ -15389,7 +15944,16 @@ async function resumeSmartPendingNode(node, logContext={}){
         if(task.failed && task.recoverTaskId) return;
         try {
             const result = await pollSmartCanvasTask(task.taskId);
-            finalizeSmartPendingTask(node, task.taskId, resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result)), task.kind || 'image');
+            const sourceImages = resultMediaUrls(result?.image_items?.length ? result.image_items : (result?.images?.length ? result.images : result));
+            rememberFixedSeedGenerationResult(task.seedCacheKey, sourceImages);
+            const images = repeatFixedSeedBatchImages(sourceImages, task.repeatCount || 1);
+            finalizeSmartPendingTask(
+                node,
+                task.taskId,
+                images,
+                task.kind || 'image',
+                task.imageMeta || logContext.imageMeta || null
+            );
             render();
             scheduleSave();
         } catch(e) {

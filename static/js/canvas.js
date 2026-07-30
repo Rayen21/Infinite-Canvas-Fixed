@@ -690,6 +690,97 @@ function providerImageModels(providerId){
     const provider = apiProviders.find(p => p.id === providerId);
     return uniqueModels(provider?.image_models || []);
 }
+function isDrawThingsProvider(provider){
+    return String(provider?.id || '').trim().toLowerCase() === 'drawthings'
+        || String(provider?.protocol || '').trim().toLowerCase() === 'grpc';
+}
+// Keep Draw Things seeds in the same uint32 range as the canvas/ComfyUI seed controls.
+function drawThingsRandomSeed(){ return Math.floor(Math.random() * 4294967295) + 1; }
+function normalizeDrawThingsSeed(value){
+    const num = Number(value);
+    if(!Number.isFinite(num)) return drawThingsRandomSeed();
+    return Math.max(1, Math.min(4294967295, Math.floor(num)));
+}
+// 普通画布只在随机模式下显示本次实际提交的 seed；固定模式必须保留用户输入，供指纹缓存复用。
+function applyDrawThingsSeedToGenerator(gen, seeds=[]){
+    if(!gen || gen.drawThingsSeedRandom === false || !Array.isArray(seeds) || !seeds.length) return;
+    gen.drawThingsSeed = normalizeDrawThingsSeed(seeds[seeds.length - 1]);
+}
+// 统一把请求对象按 key 排序，避免对象属性插入顺序不同造成错误的指纹变化。
+function stableGenerationFingerprintValue(value){
+    if(Array.isArray(value)) return value.map(stableGenerationFingerprintValue);
+    if(value && typeof value === 'object'){
+        return Object.keys(value).sort().reduce((result, key) => {
+            result[key] = stableGenerationFingerprintValue(value[key]);
+            return result;
+        }, {});
+    }
+    return value;
+}
+// 只要存在固定 seed，就必须把完整请求和 seed 一起验证；随机模式本身不命中缓存，
+// 但生成完成后会按实际提交的 seed 暂存结果，方便关闭骰子后复用刚生成的图片。
+function generationRequestFingerprint(payload, count, fixedSeedState){
+    if(!fixedSeedState || fixedSeedState.random) return '';
+    return JSON.stringify(stableGenerationFingerprintValue({
+        request:payload || {},
+        count:Number(count) || 1,
+        seed:fixedSeedState
+    }));
+}
+function drawThingsSeedResultCacheKey(payload, seed){
+    return generationRequestFingerprint(payload, 1, {
+        provider:'drawthings',
+        seed:normalizeDrawThingsSeed(seed)
+    });
+}
+function generationSeedField(field){
+    const name = `${field?.id || ''} ${field?.input || ''} ${field?.name || ''} ${field?.fieldName || ''}`.toLowerCase();
+    return /(^|[^a-z])(seed|noise[_ -]?seed|random[_ -]?seed)([^a-z]|$)|种子|噪声/.test(name);
+}
+// ComfyUI/RunningHub 的动态参数都通过同一个 helper 判断是否是固定 seed。
+function fixedGenerationSeedState({fields=[], valueFor, randomEnabled, randomActive}){
+    const values = {};
+    let hasSeed = false;
+    let random = false;
+    (fields || []).forEach(field => {
+        if(!generationSeedField(field)) return;
+        hasSeed = true;
+        const id = field.id || field.fieldName || field.input || String(Object.keys(values).length);
+        if(randomEnabled?.(field) && randomActive?.(field)) random = true;
+        values[id] = valueFor ? valueFor(field) : undefined;
+    });
+    if(!hasSeed || random) return null;
+    return {fields:values};
+}
+function generationCachedOutputsForNode(node, out, key){
+    const cache = node?._fixedSeedGenerationCache;
+    const outputs = Array.isArray(cache?.outputs) ? cache.outputs.filter(Boolean) : [];
+    if(!key || cache?.key !== key || !outputs.length) return [];
+    // 删除过输出图片后不能继续复用已不存在的结果。
+    const available = out
+        ? outputs.every(url => outputHasUrl(out, url))
+        : outputs.every(url => (node.generatedOutputs || []).some(item => outputUrlValue(item) === url));
+    return available ? outputs : [];
+}
+function rememberGenerationOutputs(node, key, outputs){
+    if(!node || !key) return;
+    const urls = (outputs || []).map(outputUrlValue).filter(Boolean);
+    if(urls.length) node._fixedSeedGenerationCache = {key, outputs:urls};
+}
+async function refreshDrawThingsModels(){
+    const provider = apiProviders.find(p => isDrawThingsProvider(p));
+    if(!provider) return;
+    try {
+        const data = await fetch('/api/drawthings/models').then(r => r.json());
+        provider.image_models = Array.isArray(data.models) ? uniqueModels(data.models) : [];
+        provider.drawthings_connected = Boolean(data.connected);
+        provider.drawthings_status = data.message || '';
+    } catch(err){
+        provider.image_models = [];
+        provider.drawthings_connected = false;
+        provider.drawthings_status = String(err?.message || err || '连接失败');
+    }
+}
 function sanitizeImageNodeProviderModel(node){
     if(!node || node.type !== 'generator') return;
     node.apiProvider = resolveImageProviderId(node.apiProvider || '');
@@ -9838,6 +9929,7 @@ async function runRhNode(nodeId, opts={}){
     const pendingId = uid('p');
     const run = runSnapshot(node, media.prompt || 'RunningHub', media.refs);
     run.taskLabel = 'RunningHub';
+    let fixedSeedCacheKey = '';
     if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs:media.refs, cascadeTargetId})];
     if(!opts.cascade) node.running = true;
     refreshRunNodes(node, out);
@@ -9848,6 +9940,26 @@ async function runRhNode(nodeId, opts={}){
         const body = mode === 'workflow'
             ? {workflowId:node.workflowId.trim(), nodeInfoList, useWallet:rhUseWallet(node), ...workflowExtras}
             : {webappId:node.webappId.trim(), nodeInfoList, instanceType:node.instanceType || '', useWallet:rhUseWallet(node)};
+        const fields = rhActiveFields(node);
+        const fixedSeedState = fixedGenerationSeedState({
+            fields,
+            valueFor:field => nodeInfoList.find(item => rhParamKey(item.nodeId, item.fieldName) === rhParamKey(field.nodeId, field.fieldName))?.fieldValue,
+            randomEnabled:rhRandomEnabled,
+            randomActive:field => rhRandomActive(node, rhParamKey(field.nodeId, field.fieldName))
+        });
+        fixedSeedCacheKey = generationRequestFingerprint({engine:'runninghub', mode, body}, 1, fixedSeedState);
+        const cached = fixedSeedCacheKey ? generationCachedOutputsForNode(node, out, fixedSeedCacheKey) : [];
+        if(cached.length){
+            // RunningHub 的固定 seed 也按完整 nodeInfoList 指纹复用，随机字段开启时不会进入这里。
+            const cachedMeta = collectRunMeta(out, pendingId);
+            if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
+            appendOutputImages(out, cached, media.refs[0], [cachedMeta]);
+            mergeGeneratedOutputs(node, cached, Boolean(opts.cascade));
+            node.runStatus = 'done'; node.runError = ''; node.running = false;
+            refreshRunNodes(node, out);
+            scheduleSave();
+            return;
+        }
         const submit = await cascadeFetch(endpoint, {
             method:'POST',
             headers:{'Content-Type':'application/json'},
@@ -9879,6 +9991,7 @@ async function runRhNode(nodeId, opts={}){
         if(!result) throw new Error(tr('canvas.rhTimeout'));
         const outputs = result.urls || [];
         if(!outputs.length) throw new Error(tr('canvas.rhOutputsEmpty'));
+        rememberGenerationOutputs(node, fixedSeedCacheKey, outputs);
         const meta = collectRunMeta(out, pendingId);
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         appendOutputImages(out, outputs, media.refs[0], [meta]);
@@ -10443,8 +10556,44 @@ async function runGenerator(genId, opts={}){
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
+    const drawThingsSelected = isDrawThingsProvider(providerById(payload.provider_id));
+    const submittedSeeds = [];
     const quality = normalizedImageQuality(gen.quality);
     if(quality) payload.quality = quality;
+    const requestPayload = () => {
+        if(!drawThingsSelected) return payload;
+        // Match the existing dice behavior: each batch request gets a new seed
+        // while disabling the dice keeps the value entered in the node.
+        const seed = gen.drawThingsSeedRandom !== false
+            ? drawThingsRandomSeed()
+            : normalizeDrawThingsSeed(gen.drawThingsSeed);
+        submittedSeeds.push(seed);
+        return {
+            ...payload,
+            seed
+        };
+    };
+    const fixedSeedState = drawThingsSelected && gen.drawThingsSeedRandom === false
+        ? {provider:'drawthings', seed:normalizeDrawThingsSeed(gen.drawThingsSeed)}
+        : null;
+    const fixedSeedCacheKey = generationRequestFingerprint(payload, count, fixedSeedState);
+    // 将缓存键带进结果元数据，批量任务完成后可以准确归并到本次请求。
+    if(fixedSeedCacheKey) run.fixedSeedCacheKey = fixedSeedCacheKey;
+    const cachedFixedSeedOutputs = fixedSeedCacheKey
+        ? generationCachedOutputsForNode(gen, out, fixedSeedCacheKey)
+        : [];
+    if(cachedFixedSeedOutputs.length){
+        // 固定 seed 且完整请求未变化时复用当前结果，避免再次提交相同的 gRPC 任务。
+        setStatus('检测到 seed 值（种子数）相同，跳过生成');
+        mergeGeneratedOutputs(gen, cachedFixedSeedOutputs, Boolean(opts.cascade));
+        gen.runStatus = 'done';
+        gen.runError = '';
+        gen.running = false;
+        refreshRunNodes(gen, out);
+        scheduleSave();
+        return;
+    }
+    const runCacheKey = fixedSeedCacheKey;
     let pendingIds = [];
     const startedAt = nowMs();
     if(!opts.cascade){
@@ -10454,16 +10603,27 @@ async function runGenerator(genId, opts={}){
         setTimeout(() => { gen.running = false; refreshRunNodes(gen, out); }, 2000);
     }
     try {
-        const taskInfos = await Promise.all(Array.from({length:count}, () => createCanvasImageTask(payload, {cascadeTargetId})));
+        const taskInfos = await Promise.all(Array.from({length:count}, () => createCanvasImageTask(requestPayload(), {cascadeTargetId})));
+        applyDrawThingsSeedToGenerator(gen, submittedSeeds);
+        const randomSeedCacheKeys = drawThingsSelected && gen.drawThingsSeedRandom !== false
+            ? submittedSeeds.map(seed => drawThingsSeedResultCacheKey(payload, seed))
+            : [];
         if(!out){
             let outputs = [];
+            const taskOutputs = [];
             for(const task of taskInfos){
                 const result = await waitCanvasImageTaskResult(task.task_id, {cascadeTargetId});
-                outputs.push(...(result.images || []));
+                const images = result.images || [];
+                taskOutputs.push(images);
+                outputs.push(...images);
                 run.request = requestMetaFromResult(result);
             }
             if(!outputs.length) throw new Error(tr('canvas.generationFailed'));
             mergeGeneratedOutputs(gen, outputs, Boolean(opts.cascade));
+            if(runCacheKey) rememberGenerationOutputs(gen, runCacheKey, outputs);
+            else taskOutputs.forEach((images, index) => {
+                rememberGenerationOutputs(gen, randomSeedCacheKeys[index], images);
+            });
             addGenerationLog({run, outputs, runMs:nowMs() - startedAt});
             gen.runStatus = 'done';
             gen.runError = '';
@@ -10475,13 +10635,18 @@ async function runGenerator(genId, opts={}){
         pendingIds = taskInfos.map(() => uid('p'));
         if(out) out._pending = [
             ...(out._pending || []),
-            ...taskInfos.map((task, index) => makePendingForRun(pendingIds[index], run, gen, {refs, requestSize:payload.size, cascadeTargetId}, {
-                canvasTaskId:task.task_id,
-                canvasTaskType:'online-image',
-                providerId:payload.provider_id,
-                model:payload.model,
-                appendGenerated:Boolean(opts.cascade)
-            }))
+            ...taskInfos.map((task, index) => {
+                const taskCacheKey = runCacheKey || randomSeedCacheKeys[index] || '';
+                const taskRun = taskCacheKey ? {...run, fixedSeedCacheKey:taskCacheKey} : run;
+                return makePendingForRun(pendingIds[index], taskRun, gen, {refs, requestSize:payload.size, cascadeTargetId}, {
+                    canvasTaskId:task.task_id,
+                    canvasTaskType:'online-image',
+                    providerId:payload.provider_id,
+                    model:payload.model,
+                    appendGenerated:Boolean(opts.cascade),
+                    fixedSeedCacheKey:taskCacheKey
+                });
+            })
         ];
         refreshRunNodes(gen, out);
         scheduleSave();
@@ -10539,19 +10704,57 @@ async function runGeneratorLegacy(genId, opts={}){
             size:requestSize,
             reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
         };
+        const drawThingsSelected = isDrawThingsProvider(providerById(payload.provider_id));
+        const submittedSeeds = [];
+        const requestPayload = () => {
+            if(!drawThingsSelected) return payload;
+            // The legacy endpoint also honors the generator's seed control.
+            const seed = gen.drawThingsSeedRandom !== false
+                ? drawThingsRandomSeed()
+                : normalizeDrawThingsSeed(gen.drawThingsSeed);
+            submittedSeeds.push(seed);
+            return {
+                ...payload,
+                seed
+            };
+        };
         const quality = normalizedImageQuality(gen.quality);
         if(quality) payload.quality = quality;
+        const fixedSeedState = isDrawThingsProvider(providerById(payload.provider_id)) && gen.drawThingsSeedRandom === false
+            ? {provider:'drawthings', seed:normalizeDrawThingsSeed(gen.drawThingsSeed)}
+            : null;
+        const fixedSeedCacheKey = generationRequestFingerprint(payload, count, fixedSeedState);
+        const cached = fixedSeedCacheKey ? generationCachedOutputsForNode(gen, out, fixedSeedCacheKey) : [];
+        if(cached.length){
+            setStatus('检测到 seed 值（种子数）相同，跳过生成');
+            const cachedMetas = collectRunMetas(out, pendingIds);
+            if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
+            appendOutputImages(out, cached, refs[0], cachedMetas);
+            mergeGeneratedOutputs(gen, cached, Boolean(opts.cascade));
+            gen.runStatus = 'done'; gen.runError = ''; gen.running = false;
+            refreshRunNodes(gen, out);
+            scheduleSave();
+            return;
+        }
         const results = await Promise.all(Array.from({length:count}, () => fetch('/api/online-image', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify(payload)
+            body:JSON.stringify(requestPayload())
         }).then(async r => { if(!r.ok) throw new Error(await responseErrorMessage(r, tr('canvas.generationFailed'))); return r.json(); })));
+        applyDrawThingsSeedToGenerator(gen, submittedSeeds);
         const images = results.flatMap(result => result.images || []);
+        const randomSeedCacheKeys = drawThingsSelected && gen.drawThingsSeedRandom !== false
+            ? submittedSeeds.map(seed => drawThingsSeedResultCacheKey(payload, seed))
+            : [];
         const metas = collectRunMetas(out, pendingIds);
         run.request = results[0] ? requestMetaFromResult(results[0]) : {};
         if(out) out._pending = (out._pending||[]).filter(p => !pendingIds.includes(p.id));
         appendOutputImages(out, images, refs[0], metas);
         mergeGeneratedOutputs(gen, images, Boolean(opts.cascade));
+        if(fixedSeedCacheKey) rememberGenerationOutputs(gen, fixedSeedCacheKey, images);
+        else results.forEach((result, index) => {
+            rememberGenerationOutputs(gen, randomSeedCacheKeys[index], result.images || []);
+        });
         addGenerationLog({run, outputs:images, runMs:Math.max(...metas.map(m => m.runMs || 0), 0)});
         gen.runStatus = 'done'; gen.runError = '';
         refreshRunNodes(gen, out);
@@ -11254,6 +11457,21 @@ async function runLTXDirectorNode(nodeId, opts={}){
             [LTX_DIRECTOR_WF_NODE]:directorInputs,
             [LTX_DIRECTOR_SEED_NODE]:{noise_seed:Number(node.noiseSeed ?? 12)}
         };
+        const fixedSeedCacheKey = generationRequestFingerprint({engine:'comfy', workflow:LTX_DIRECTOR_WORKFLOW, prompt:globalPrompt, params}, 1, {
+            provider:'comfy',
+            fields:{noise_seed:Number(node.noiseSeed ?? 12)}
+        });
+        const cached = generationCachedOutputsForNode(node, out, fixedSeedCacheKey);
+        if(cached.length){
+            const cachedMeta = collectRunMeta(out, pendingId);
+            if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
+            appendOutputImages(out, cached, refs[0], [cachedMeta]);
+            mergeGeneratedOutputs(node, cached, Boolean(opts.cascade));
+            node.runStatus = 'done'; node.runError = ''; node.running = false;
+            refreshRunNodes(node, out);
+            scheduleSave();
+            return;
+        }
         const result = await runQueuedComfyGenerate({
             prompt:globalPrompt,
             workflow_json:LTX_DIRECTOR_WORKFLOW,
@@ -11265,6 +11483,7 @@ async function runLTXDirectorNode(nodeId, opts={}){
         if(result.error) throw new Error(result.error);
         const outputs = comfyResultOutputs(result);
         if(!outputs.length) throw new Error(tr('canvas.ltxNoOutput'));
+        rememberGenerationOutputs(node, fixedSeedCacheKey, outputs);
         const meta = collectRunMeta(out, pendingId);
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         appendOutputImages(out, outputs, refs[0], [meta]);
@@ -11315,6 +11534,7 @@ async function runComfyNode(nodeId, opts={}){
     const pendingId = uid('p');
     const run = runSnapshot(node, prompt, refs);
     run.taskLabel = comfyRunLabel(node);
+    let fixedSeedCacheKey = '';
     const requestSize = mode === 'text' ? {width:Number(node.width || 1024), height:Number(node.height || 1024)} : null;
     if(out) out._pending = [...(out._pending||[]), makePendingForRun(pendingId, run, node, {refs, requestSize, cascadeTargetId})];
     if(!opts.cascade){
@@ -11396,6 +11616,25 @@ async function runComfyNode(nodeId, opts={}){
                 }
                 params[f.node][f.input] = comfyParamValue(node, f);
             });
+            const fixedSeedState = fixedGenerationSeedState({
+                fields:settingFields,
+                valueFor:f => comfyParamValue(node, f),
+                randomEnabled:comfyRandomEnabled,
+                randomActive:f => comfyRandomActive(node, f.id)
+            });
+            fixedSeedCacheKey = generationRequestFingerprint({engine:'comfy', mode, workflow:workflowName, prompt, refs:allRefs, params}, 1, fixedSeedState);
+            const cached = fixedSeedCacheKey ? generationCachedOutputsForNode(node, out, fixedSeedCacheKey) : [];
+            if(cached.length){
+                // Comfy 固定 seed 与其它 provider 使用同一套完整请求指纹，命中时不再重复提交。
+                const cachedMeta = collectRunMeta(out, pendingId);
+                if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
+                appendOutputImages(out, cached, refs[0], [cachedMeta]);
+                mergeGeneratedOutputs(node, cached, Boolean(opts.cascade));
+                node.runStatus = 'done'; node.runError = ''; node.running = false;
+                refreshRunNodes(node, out);
+                scheduleSave();
+                return;
+            }
             const result = await runQueuedComfyGenerate({
                 prompt,
                 workflow_json:workflowName,
@@ -11407,6 +11646,7 @@ async function runComfyNode(nodeId, opts={}){
             if(result.error) throw new Error(actionFailed('canvas.comfyCustom', result.error));
             images = comfyResultOutputs(result);
             if(!images.length) throw new Error(noReturnedImage('canvas.comfyCustom'));
+            rememberGenerationOutputs(node, fixedSeedCacheKey, images);
         } else {
             run.taskLabel = tr('canvas.comfyEdit');
             const names = [];
@@ -12390,6 +12630,7 @@ function completeRecoverPendingOutput(out, pending, result){
     const gen = nodes.find(n => n.id === meta.run?.node?.id);
     if(gen){
         mergeGeneratedOutputs(gen, images, Boolean(pending.appendGenerated));
+        rememberGenerationOutputs(gen, pending.fixedSeedCacheKey, images);
         gen.runStatus = 'done';
         gen.runError = '';
         gen.running = false;
@@ -12508,6 +12749,15 @@ function completeCanvasImageTask(taskId, result){
     const gen = nodes.find(n => n.id === meta.run?.node?.id);
     if(gen){
         mergeGeneratedOutputs(gen, images, Boolean(pending.appendGenerated));
+        // 批量任务逐个完成；只有本次固定 seed 的同组任务全部结束后才写入缓存。
+        const sameRunPending = (out._pending || []).some(item => item.fixedSeedCacheKey === pending.fixedSeedCacheKey);
+        if(!sameRunPending && pending.fixedSeedCacheKey){
+            const cachedImages = (out.images || [])
+                .filter(item => item?.fixedSeedCacheKey === pending.fixedSeedCacheKey)
+                .map(outputUrlValue)
+                .filter(Boolean);
+            rememberGenerationOutputs(gen, pending.fixedSeedCacheKey, cachedImages);
+        }
         gen.runStatus = 'done';
         gen.runError = '';
         gen.running = false;
@@ -12632,6 +12882,7 @@ function appendOutputImages(out, images, compareRef, metas=[], layout=null){
         if(source.kind || source.mediaKind) item.kind = source.kind || source.mediaKind;
         if(meta.kind) item.kind = meta.kind;
         if(meta.grid) item.grid = meta.grid;
+        if(meta.run?.fixedSeedCacheKey) item.fixedSeedCacheKey = meta.run.fixedSeedCacheKey;
         return item;
     })];
     if(compareRef?.url){
