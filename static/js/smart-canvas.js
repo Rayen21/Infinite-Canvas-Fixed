@@ -309,6 +309,8 @@ let settings = {
     // Draw Things 的 seed 只在选择 gRPC provider 时使用，其他 provider 不携带该字段。
     drawThingsSeed:0,
     drawThingsSeedRandom:true,
+    drawThingsLoraFile:'',
+    drawThingsLoraWeight:1,
     customRatio:'',
     customRatioWidth:'',
     customRatioHeight:'',
@@ -2427,6 +2429,70 @@ function providerImageModels(providerId){
     if(providerId === 'volcengine') return volcengineProvider().image_models || [];
     return (apiProviders || []).find(p => p.id === providerId)?.image_models || [];
 }
+function drawThingsProvider(providerId=settings.provider_id){
+    return (apiProviders || []).find(provider =>
+        isDrawThingsProvider(provider.id) &&
+        (!providerId || String(provider.id) === String(providerId))
+    ) || null;
+}
+function drawThingsLoras(providerId=settings.provider_id){
+    const provider = drawThingsProvider(providerId);
+    return Array.isArray(provider?.drawthings_loras) ? provider.drawthings_loras : [];
+}
+function drawThingsModelMetadata(providerId=settings.provider_id){
+    const provider = drawThingsProvider(providerId);
+    return Array.isArray(provider?.drawthings_model_metadata) ? provider.drawthings_model_metadata : [];
+}
+function drawThingsMetadataFamily(item){
+    const value = typeof item === 'string'
+        ? item
+        : ['version', 'prefix', 'name', 'file'].map(key => item?.[key] || '').join(' ');
+    const compact = String(value).toLowerCase().replace(/[._-]/g, '');
+    if(compact.includes('qwenimageedit') || compact.includes('qwenedit')) return 'qwenedit';
+    if(compact.includes('zimage')) return 'z_image';
+    if(compact.includes('klein') || compact.includes('flux2klein')) return 'klein';
+    return '';
+}
+function selectedDrawThingsLoras(runSettings=settings){
+    const file = String(runSettings?.drawThingsLoraFile || '').trim();
+    if(!file) return [];
+    let weight = Number(runSettings?.drawThingsLoraWeight);
+    if(!Number.isFinite(weight)) weight = 1;
+    return [{file, weight:Math.max(-5, Math.min(5, weight))}];
+}
+function selectedDrawThingsLora(runSettings=settings){
+    const file = String(runSettings?.drawThingsLoraFile || '').trim();
+    return drawThingsLoras(runSettings?.provider_id).find(item => String(item?.file || '').trim() === file) || null;
+}
+function drawThingsLoraCompatibility(runSettings=settings){
+    const selected = selectedDrawThingsLora(runSettings);
+    if(!selected) return '';
+    const modelMetadata = drawThingsModelMetadata(runSettings?.provider_id).find(item =>
+        String(item?.file || '').trim() === String(runSettings?.model || '').trim()
+    );
+    const currentFamily = drawThingsMetadataFamily(modelMetadata) || drawThingsMetadataFamily(runSettings?.model);
+    const loraFamily = drawThingsMetadataFamily(selected);
+    if(!currentFamily || !loraFamily || currentFamily === loraFamily) return '';
+    return trf('smart.drawThingsLoraIncompatible', {model:currentFamily, lora:loraFamily});
+}
+async function refreshSmartDrawThingsModels(){
+    const provider = drawThingsProvider();
+    if(!provider) return;
+    try {
+        const data = await fetch('/api/drawthings/models').then(response => response.json());
+        provider.image_models = Array.isArray(data.models) ? [...new Set(data.models.filter(Boolean))] : [];
+        provider.drawthings_model_metadata = Array.isArray(data.model_metadata) ? data.model_metadata : [];
+        provider.drawthings_loras = Array.isArray(data.loras) ? data.loras : [];
+        provider.drawthings_connected = Boolean(data.connected);
+        provider.drawthings_status = data.message || '';
+    } catch(error){
+        provider.drawthings_model_metadata = [];
+        provider.drawthings_loras = [];
+        provider.drawthings_connected = false;
+        provider.drawthings_status = String(error?.message || error || '连接失败');
+    }
+    if(isDrawThingsProvider(settings.provider_id)) renderDynamicParams();
+}
 // Draw Things 的 provider 由用户在 API 设置中添加，使用 id/protocol 双重判断以兼容已有配置。
 function isDrawThingsProvider(providerId){
     // 运行时配置尚未刷新时也要识别已保存的 Draw Things provider。
@@ -2983,6 +3049,7 @@ function renderApiParams(){
         ${renderQualityControl()}
         ${renderCountVisualControl()}
         ${renderDrawThingsSeedControl()}
+        ${renderDrawThingsLoraControl()}
         ${isJimengProviderId(settings.provider_id) ? renderJimengUpscaleControl() : ''}
     `;
 }
@@ -3529,6 +3596,40 @@ function renderDrawThingsSeedControl(){
             <span class="num-label">${escapeHtml(tr('smart.drawThingsSeed'))}</span>
             <input type="number" min="1" max="4294967295" step="1" data-drawthings-seed value="${escapeHtml(seed)}">
             <button type="button" class="dice-btn ${active ? 'active' : ''}" data-drawthings-seed-random title="${escapeHtml(active ? tr('smart.diceOn') : tr('smart.diceOff'))}" aria-label="${escapeHtml(active ? tr('smart.diceOn') : tr('smart.diceOff'))}"><i data-lucide="dice-5"></i></button>
+        </div>
+    </div>`;
+}
+function renderDrawThingsLoraControl(){
+    if(!isDrawThingsProvider(settings.provider_id) || settings.apiKind === 'video') return '';
+    const loras = drawThingsLoras(settings.provider_id);
+    const selectedFile = String(settings.drawThingsLoraFile || '').trim();
+    const selected = loras.find(item => String(item?.file || '').trim() === selectedFile);
+    const rawWeight = Number(settings.drawThingsLoraWeight);
+    const weight = Number.isFinite(rawWeight) ? Math.max(-5, Math.min(5, rawWeight)) : 1;
+    const selectedLabel = selected ? String(selected.name || selected.file || '').trim() : '';
+    const summary = selectedLabel
+        ? `${tr('smart.drawThingsLora')} · ${selectedLabel} · ${weight}`
+        : tr('smart.drawThingsLora');
+    const compatibility = selected ? drawThingsLoraCompatibility(settings) : '';
+    const options = [
+        `<option value="">${escapeHtml(tr('smart.drawThingsLoraNone'))}</option>`,
+        ...loras.map(item => {
+            const file = String(item?.file || '').trim();
+            if(!file) return '';
+            const label = String(item?.name || file).trim();
+            return `<option value="${escapeHtml(file)}" ${file === selectedFile ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+        }),
+    ].join('');
+    return `<div class="smart-control drawthings-lora-control">
+        <button class="smart-pill" type="button" title="${escapeAttr(summary)}"><span class="drawthings-lora-summary">${escapeHtml(summary)}</span></button>
+        <div class="smart-popover compact-popover" style="min-width:250px">
+            <div class="smart-popover-title">${escapeHtml(tr('smart.drawThingsLora'))}</div>
+            <select data-drawthings-lora-file>${options}</select>
+            <label class="drawthings-lora-weight-label">${escapeHtml(tr('smart.drawThingsLoraWeight'))}
+                <input type="number" min="-5" max="5" step="0.05" data-drawthings-lora-weight value="${escapeHtml(weight)}">
+            </label>
+            ${compatibility ? `<div class="drawthings-lora-warning">${escapeHtml(compatibility)}</div>` : ''}
+            ${!loras.length ? `<div class="drawthings-lora-empty">${escapeHtml(tr('smart.drawThingsLoraEmpty'))}</div>` : ''}
         </div>
     </div>`;
 }
@@ -4235,6 +4336,28 @@ function bindDynamicParams(){
             scheduleSave();
         };
     });
+    dynamicParams.querySelectorAll('[data-drawthings-lora-file]').forEach(input => {
+        input.onclick = event => event.stopPropagation();
+        input.onchange = event => {
+            event?.stopPropagation?.();
+            settings.drawThingsLoraFile = String(input.value || '');
+            persistActiveSmartSettings();
+            renderDynamicParams();
+            scheduleSave();
+        };
+    });
+    dynamicParams.querySelectorAll('[data-drawthings-lora-weight]').forEach(input => {
+        input.onclick = event => event.stopPropagation();
+        input.oninput = input.onchange = event => {
+            event?.stopPropagation?.();
+            let value = Number(input.value);
+            if(!Number.isFinite(value)) value = 1;
+            value = Math.max(-5, Math.min(5, value));
+            settings.drawThingsLoraWeight = value;
+            persistActiveSmartSettings();
+            scheduleSave();
+        };
+    });
     dynamicParams.querySelectorAll('[data-toggle-param]').forEach(btn => {
         btn.onclick = event => {
             event.preventDefault();
@@ -4394,6 +4517,7 @@ async function loadConfig(){
         // 提供商配置已就绪即先渲染参数面板，避免等工作流/RunningHub 预取完成后参数才「突然刷新出来」。
         sanitizeSmartApiSelection(settings);
         updateProviderModels();
+        if(apiProviders.some(provider => isDrawThingsProvider(provider.id))) void refreshSmartDrawThingsModels();
         const wf = await fetch('/api/workflows').then(r => r.json()).catch(() => ({workflows:[]}));
         comfyWorkflows = Array.isArray(wf.workflows) ? wf.workflows : [];
         runningHubWorkflowCache = {};
@@ -15244,7 +15368,10 @@ async function runApiGeneration(prompt, refs, runSettings=settings, cacheOptions
     const drawThingsSelected = isDrawThingsProvider(runSettings.provider_id);
     const count = smartApiImageTaskCount(runSettings);
     const drawThingsBatchSize = 1;
-    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:runSettings.ratio === 'custom' ? (runSettings.customRatio || '') : (runSettings.ratio || ''), resolution:runSettings.resolution || '', quality:runSettings.quality || 'auto', n:1, batch_size:drawThingsBatchSize, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX)};
+    const loras = drawThingsSelected ? selectedDrawThingsLoras(runSettings) : [];
+    const loraCompatibility = drawThingsSelected ? drawThingsLoraCompatibility(runSettings) : '';
+    if(loraCompatibility) throw new Error(loraCompatibility);
+    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:runSettings.ratio === 'custom' ? (runSettings.customRatio || '') : (runSettings.ratio || ''), resolution:runSettings.resolution || '', quality:runSettings.quality || 'auto', n:1, batch_size:drawThingsBatchSize, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX), loras};
     const cachePayload = drawThingsSelected ? drawThingsCachePayload(payload, cacheOptions) : payload;
     const fixedSeedState = drawThingsSelected && runSettings.drawThingsSeedRandom === false
         ? {provider:'drawthings', seed:normalizeDrawThingsSeed(runSettings.drawThingsSeed)}
