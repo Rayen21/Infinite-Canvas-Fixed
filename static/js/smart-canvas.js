@@ -380,6 +380,17 @@ const SIZE_MAP = {
     ultrawide: {'1k':'1280x544','2k':'2048x880','4k':'3840x1648'},
     ultratall: {'1k':'544x1280','2k':'880x2048','4k':'1648x3840'}
 };
+const API_RATIO_VALUES = {
+    square:'1:1',
+    portrait:'2:3',
+    landscape:'3:2',
+    portrait43:'3:4',
+    landscape43:'4:3',
+    story:'9:16',
+    wide:'16:9',
+    ultrawide:'21:9',
+    ultratall:'9:21'
+};
 const RES_LONG_SIDE = { '1k':1536, '2k':2048, '4k':3840 };
 const RES_PIXEL_LIMIT = { '1k':1572864, '2k':4194304, '4k':8294400 };
 function tr(key){ return window.StudioI18n?.t ? window.StudioI18n.t(key) : key; }
@@ -2684,8 +2695,8 @@ const JIMENG_SEEDANCE_VIDEO_MODELS = ['seedance2.0_vip', 'seedance2.0fast_vip', 
 const JIMENG_VIDEO_MODELS_BY_COMMAND = {
     text2video: JIMENG_SEEDANCE_VIDEO_MODELS,
     multimodal2video: JIMENG_SEEDANCE_VIDEO_MODELS,
-    image2video: ['3.0', '3.0fast', '3.0pro', '3.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
-    frames2video: ['3.0', '3.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
+    image2video: ['seedance1.0fast', 'seedance1.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
+    frames2video: ['seedance1.5pro', ...JIMENG_SEEDANCE_VIDEO_MODELS],
 };
 function jimengVideoCommand(){
     const node = activeComposerNode() || selectedNode();
@@ -15371,7 +15382,7 @@ async function runApiGeneration(prompt, refs, runSettings=settings, cacheOptions
     const loras = drawThingsSelected ? selectedDrawThingsLoras(runSettings) : [];
     const loraCompatibility = drawThingsSelected ? drawThingsLoraCompatibility(runSettings) : '';
     if(loraCompatibility) throw new Error(loraCompatibility);
-    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:runSettings.ratio === 'custom' ? (runSettings.customRatio || '') : (runSettings.ratio || ''), resolution:runSettings.resolution || '', quality:runSettings.quality || 'auto', n:1, batch_size:drawThingsBatchSize, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX), loras};
+    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : ''), resolution:['1k','2k','4k'].includes(runSettings.resolution) ? runSettings.resolution : '', quality:runSettings.quality || 'auto', n:1, batch_size:drawThingsBatchSize, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX), loras};
     const cachePayload = drawThingsSelected ? drawThingsCachePayload(payload, cacheOptions) : payload;
     const fixedSeedState = drawThingsSelected && runSettings.drawThingsSeedRandom === false
         ? {provider:'drawthings', seed:normalizeDrawThingsSeed(runSettings.drawThingsSeed)}

@@ -96,7 +96,8 @@ const GEMINI_CLI_DEFAULT_IMAGE_MODELS = ['auto'];
 const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto'];
 const CLI_PROTOCOLS = new Set(['jimeng', 'codex', 'gemini-cli']);
 const DRAW_THINGS_DEFAULT_ENDPOINT = '127.0.0.1:7859';
-const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'tudou', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli', 'grpc'];
+const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
+API_PROTOCOLS.push('tudou', 'grpc');
 const CLI_PROVIDER_PRESETS = {
     jimeng:{id:'jimeng', name:'即梦 CLI', protocol:'jimeng'},
     codex:{id:'codex', name:'GPT CLI', protocol:'codex'},
@@ -162,8 +163,8 @@ const RECOMMENDED_APIS = [
         name:'土豆API',
         category:'value',
         base_url:'https://api.ai-tudou.net',
-        protocol:'tudou',
-        image_request_mode:'openai',
+        protocol:'openai',
+        image_request_mode:'tudou-async',
         register_url:'https://api.ai-tudou.net/register?aff=GmBu',
         tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
         icons:['IMG','VID','LLM'],
@@ -305,7 +306,7 @@ const RECOMMEND_GROUPS = [
     {key:'value', titleKey:'api.recommendGroupValue', icon:'badge-percent'},
     {key:'free', titleKey:'api.recommendGroupFree', icon:'gift'}
 ];
-const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['tudou', 'exellome', 'fhl']);
+const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['exellome', 'fhl']);
 function lockedRecommendedApi(itemOrId){
     const id = typeof itemOrId === 'string' ? itemOrId : itemOrId?.id;
     const name = typeof itemOrId === 'string' ? '' : itemOrId?.name;
@@ -2510,12 +2511,20 @@ function renderEditor(){
     const lockedApi = lockedRecommendedApi(item);
     if(lockedApi) applyLockedRecommendedProtocol(item);
     if(protocolInput){
-        protocolInput.value = item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : (item.protocol || 'openai');
-        protocolInput.disabled = FIXED_PROTOCOL_PROVIDER_IDS.has(item.id) || item.id === 'drawthings' || Boolean(lockedApi);
+        const protocolValue = String(item.protocol || 'openai').toLowerCase();
+        protocolInput.value = item.id === 'runninghub'
+            ? 'runninghub'
+            : item.id === 'volcengine'
+            ? 'volcengine'
+            : API_PROTOCOLS.includes(protocolValue)
+            ? protocolValue
+            : 'openai';
+        protocolInput.disabled = FIXED_PROTOCOL_PROVIDER_IDS.has(item.id) || Boolean(lockedApi);
         protocolInput.title = lockedApi ? '推荐平台使用固定协议' : (protocolInput.disabled ? '内置平台使用固定协议' : '');
     }
     if(imageRequestModeInput){
-        imageRequestModeInput.value = normalizeImageRequestMode(item.image_request_mode);
+        const requestedMode = normalizeImageRequestMode(item.image_request_mode);
+        imageRequestModeInput.value = requestedMode;
         imageRequestModeInput.disabled = Boolean(lockedApi) || item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase()) || String(protocolInput?.value || item.protocol || '').toLowerCase() === 'grpc';
         imageRequestModeInput.title = lockedApi ? '推荐平台使用固定图片协议' : '';
     }
@@ -2921,7 +2930,7 @@ function currentProviderApiKey(item){
 }
 function normalizeImageRequestMode(value){
     const mode = String(value || '').trim().toLowerCase();
-    return ['openai', 'openai-json', 'openai-video-proxy', 'openai-responses'].includes(mode) ? mode : 'openai';
+    return ['openai', 'openai-json', 'openai-video-proxy', 'openai-responses', 'tudou-async'].includes(mode) ? mode : 'openai';
 }
 function normalizeImageEditRoute(value){
     const route = String(value || '').trim().toLowerCase();
@@ -2932,6 +2941,7 @@ function imageRequestModeLabel(mode){
     if(normalized === 'openai-json') return 'OpenAI JSON';
     if(normalized === 'openai-video-proxy') return 'OpenAI 中转';
     if(normalized === 'openai-responses') return 'OpenAI RS';
+    if(normalized === 'tudou-async') return '土豆 GPT-Image-2 异步';
     return 'OpenAI 标准';
 }
 function isRunningHubContext(item, baseUrl=''){
@@ -3013,6 +3023,18 @@ async function probeAsync(){
     if(!item) return;
     const btn = document.getElementById('probeAsyncBtn');
     const baseUrl = baseInput.value.trim();
+    let isTudouHost = false;
+    try {
+        const host = new URL(baseUrl).hostname.toLowerCase();
+        isTudouHost = host === 'api.ai-tudou.net' || host.endsWith('.ai-tudou.net');
+    } catch(e) {}
+    // The official Tudou host has a dedicated GPT-Image-2 async image route.
+    // Select it before the network check so a failed probe never leaves this
+    // known platform displayed as the generic OpenAI image interface.
+    if(isTudouHost && imageRequestModeInput){
+        item.image_request_mode = 'tudou-async';
+        imageRequestModeInput.value = 'tudou-async';
+    }
     const isCliProtocol = CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
     if(!baseUrl && !isCliProtocol){ alert('请先填写请求地址'); return; }
     if(btn){ btn.disabled = true; btn.querySelector('span').textContent = '检测中...'; }
@@ -3059,11 +3081,12 @@ async function probeAsync(){
         const detectedProtocol = String(data.protocol || '').toLowerCase();
         const isAsync = data.ok === true && detectedProtocol === 'apimart';
         const isOpenAiCompat = data.ok === true && detectedProtocol === 'openai';
-        const keepManualProtocol = ['gemini', 'tudou', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(currentProtocol);
+        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(currentProtocol);
         if(protocolInput && !keepManualProtocol){
             applyDetectedProtocol(detectedProtocol || (isAsync ? 'apimart' : 'openai'));
         }
         if(data.image_request_mode) applyDetectedImageRequestMode(data.image_request_mode);
+        if(isTudouHost) applyDetectedImageRequestMode('tudou-async');
         const rawJson = JSON.stringify(data.raw, null, 2);
         const probeMessage = String(data.message || '');
         const hideTasksEndpointTip = probeMessage.includes('/v1/tasks/');
@@ -3086,7 +3109,7 @@ async function probeAsync(){
                 <pre style="margin-top:6px;padding:10px 12px;border-radius:10px;background:var(--soft);border:1px solid var(--line-2);font-size:10.5px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;color:var(--text);max-height:200px;overflow:auto">${escapeHtml(rawJson)}</pre>
             </details>`);
     } catch(e){
-        const keepManualProtocol = ['gemini', 'tudou', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
+        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
         if(protocolInput && !keepManualProtocol){ protocolInput.value = 'openai'; protocolInput.dispatchEvent(new Event('change')); }
         const suffix = keepManualProtocol ? '，已保留当前手动选择的协议' : '，协议已设为 OpenAI 兼容';
         showVerifyResult(`<div style="font-size:11px;font-weight:800;color:#b45309">⚠ ${escapeHtml(e.message || String(e))}${suffix}</div>`);
@@ -3127,7 +3150,8 @@ async function testConnection(){
             if(detectedProtocol && detectedProtocol !== String(protocolInput?.value || '').toLowerCase()){
                 applyDetectedProtocol(detectedProtocol);
             }
-            if(data.image_request_mode) applyDetectedImageRequestMode(data.image_request_mode);
+            // "验证地址" only checks reachability. Protocol and image-interface
+            // selection are intentionally left untouched for this action.
             // 存入 picker 状态并启用「选择模型」按钮，但不自动弹出
             lastFetchedAll = data.all || [];
             lastFetchedSuggestion = {
