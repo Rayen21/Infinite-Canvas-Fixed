@@ -2735,6 +2735,8 @@ class OnlineImageRequest(BaseModel):
     batch_size: int = 1
     seed: Optional[int] = None
     reference_images: List[AIReference] = []
+    mask_images: List[AIReference] = []
+    loras: Optional[List[Dict[str, Any]]] = None
     operation: str = ""
     resolution_type: str = ""
 
@@ -11241,7 +11243,7 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
-async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution="", seed=None, batch_size=1):
+async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution="", seed=None, batch_size=1, loras=None, mask_images=None):
     provider = get_api_provider(provider_id)
     if is_tudou_provider(provider):
         model = tudou_image_model_for_request(model)
@@ -11249,26 +11251,59 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         from draw_things_grpc import draw_things_model_supports_editing
 
         drawthings_references = []
+        drawthings_masks = []
+        seen_sources = set()
         for reference in (reference_images or []):
             item = dict(reference) if isinstance(reference, dict) else {"url": reference}
             url = str(item.get("url") or "").strip()
+            is_mask = (
+                str(item.get("role") or "").strip().lower() == "mask"
+                or bool(re.search(r"(?:^|_)mask\.(?:png|jpe?g|webp)$", str(item.get("name") or "").strip(), re.IGNORECASE))
+            )
             # Canvas references normally use /output or /assets URLs. Resolve
             # those to local files before passing them to the gRPC client;
             # other providers keep their existing reference handling.
             local_path = local_media_path_from_url(url)
+            target = drawthings_masks if is_mask else drawthings_references
             if local_path:
-                drawthings_references.append({
+                target.append({
                     "path": local_path,
                     "name": item.get("name") or os.path.basename(local_path),
                     "weight": item.get("weight", 1.0),
                 })
             elif url:
-                drawthings_references.append(item)
+                target.append(item)
+            if url:
+                seen_sources.add(url)
+        for reference in (mask_images or []):
+            item = dict(reference) if isinstance(reference, dict) else {"url": reference}
+            url = str(item.get("url") or "").strip()
+            if url and url in seen_sources:
+                continue
+            local_path = local_media_path_from_url(url)
+            if local_path:
+                drawthings_masks.append({
+                    "path": local_path,
+                    "name": item.get("name") or os.path.basename(local_path),
+                    "weight": item.get("weight", 1.0),
+                })
+            elif url:
+                drawthings_masks.append(item)
         editing_model = draw_things_model_supports_editing(model)
         if not editing_model and len(drawthings_references) > 1:
             raise HTTPException(
                 status_code=400,
                 detail="当前 Draw Things 模型只支持文生图或单图图生图，不能输入多张参考图。",
+            )
+        if len(drawthings_masks) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="当前 Draw Things 请求只支持一张遮罩图。",
+            )
+        if drawthings_masks and not drawthings_references:
+            raise HTTPException(
+                status_code=400,
+                detail="遮罩需要与一张输入图一起使用。",
             )
         try:
             from draw_things_grpc import generate_draw_things_image
@@ -11277,8 +11312,16 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 "endpoint": provider.get("base_url") or "",
                 "seed": seed,
                 "batch_size": batch_size,
+                "loras": loras or [],
             }
-            if editing_model:
+            if drawthings_masks:
+                # Draw Things masks belong to ImageGenerationRequest.mask and
+                # must not be counted as a second ordinary reference image.
+                request_options.update(
+                    reference_images=drawthings_references,
+                    mask_images=drawthings_masks,
+                )
+            elif editing_model:
                 request_options.update(
                     hint_images=drawthings_references,
                     hint_type="shuffle" if drawthings_references else "",
@@ -13257,11 +13300,19 @@ async def api_providers():
 async def drawthings_models():
     provider = next((item for item in load_api_providers() if item.get("id") == "drawthings"), None)
     if not provider:
-        return {"connected": False, "models": [], "message": "Draw Things provider 尚未添加"}
+        return {
+            "connected": False,
+            "models": [],
+            "model_metadata": [],
+            "loras": [],
+            "message": "Draw Things provider 尚未添加",
+        }
     result = await fetch_models_from_upstream(provider.get("base_url") or "", "", "grpc", "openai")
     return {
         "connected": bool(result.get("ok")),
         "models": result.get("image_models") or [],
+        "model_metadata": result.get("model_metadata") or [],
+        "loras": result.get("loras") or [],
         "message": result.get("message") or "",
     }
 
@@ -13643,6 +13694,8 @@ async def test_provider_connection(payload: TestConnectionPayload):
             "chat_models": [],
             "video_models": [],
             "all": models,
+            "model_metadata": result.get("model_metadata") or [],
+            "loras": result.get("loras") or [],
             "raw": result,
         }
     base_url = (payload.base_url or "").strip().rstrip("/")
@@ -13906,6 +13959,8 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
             "chat_models": [],
             "video_models": [],
             "all": models,
+            "model_metadata": result.get("model_metadata") or [],
+            "loras": result.get("loras") or [],
             "raw": result,
         }
     if protocol == "jimeng":
@@ -14055,6 +14110,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
     model = selected_model(payload.model, default_model)
     request_size = snap_size_to_multiple(payload.size, 16)
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
+    mask_refs = [ref.dict() for ref in payload.mask_images if ref.url]
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
     batch_size = max(1, min(8, int(payload.batch_size or 1))) if is_draw_things_provider(provider) else 1
@@ -14074,6 +14130,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
             image_data, raw_item = await generate_ai_image(
                 payload.prompt, request_size, payload.quality, model, image_refs, provider["id"],
                 payload.aspect_ratio, payload.resolution, payload.seed, batch_size=batch_size,
+                loras=payload.loras, mask_images=mask_refs,
             )
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
@@ -14117,7 +14174,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "aspect_ratio": payload.aspect_ratio, "resolution": payload.resolution, "quality": payload.quality, "n": count, "batch_size": batch_size, "reference_images": refs},
+        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "aspect_ratio": payload.aspect_ratio, "resolution": payload.resolution, "quality": payload.quality, "n": count, "batch_size": batch_size, "reference_images": refs, "mask_images": mask_refs},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)

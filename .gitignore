@@ -47,3 +47,6 @@ node_modules/
 
 # Project revision plan list
 IMPLEMENTATION_PLAN.md
+
+# Local feature backups and patch records
+/bak/

@@ -1182,6 +1182,15 @@ function smartSettingsForNode(node){
         ...recentSettings,
         ...nodeSettings
     };
+    // 选中节点上一轮输出时，imageMeta 是生成时的历史快照。当前节点设置
+    // 可能已经被用户修改（尤其是 Draw Things 的随机 seed 开关），不能
+    // 让历史快照覆盖刚刚持久化的节点设置。
+    if(Object.prototype.hasOwnProperty.call(node?.runSettings || {}, 'drawThingsSeed')){
+        base.drawThingsSeed = node.runSettings.drawThingsSeed;
+    }
+    if(Object.prototype.hasOwnProperty.call(node?.runSettings || {}, 'drawThingsSeedRandom')){
+        base.drawThingsSeedRandom = node.runSettings.drawThingsSeedRandom;
+    }
     normalizeSmartVideoModeSettings(base, true);
     return withOutpaintDisplaySettings(node, base);
 }
@@ -2517,6 +2526,26 @@ function drawThingsModelSupportsEditing(model){
     if(normalized.includes('klein')) return true;
     return normalized.includes('qwen') && normalized.includes('edit');
 }
+function drawThingsReferenceIsMask(ref){
+    if(!ref) return false;
+    if(ref.mask === true || ref.isMask === true || ref.is_mask === true || ref.maskImage === true || ref.mask_image === true) return true;
+    const fields = [ref.type, ref.kind, ref.role, ref.maskType, ref.mask_type, ref.mediaRole, ref.media_role];
+    if(fields.some(value => ['mask', 'inpaint_mask', 'inpainting_mask'].includes(String(value || '').trim().toLowerCase()))) return true;
+    const metadata = ref.metadata || ref.meta || {};
+    if(metadata && typeof metadata === 'object'){
+        if(metadata.mask === true || metadata.isMask === true || metadata.is_mask === true) return true;
+        if(['mask', 'inpaint_mask', 'inpainting_mask'].includes(String(metadata.role || metadata.type || metadata.kind || '').trim().toLowerCase())) return true;
+    }
+    const filename = value => String(value || '').trim().split(/[?#]/, 1)[0].split('/').pop() || '';
+    return /(?:^|[_-])mask\.(?:png|jpe?g|webp)$/i.test(filename(ref.name))
+        || /(?:^|[_-])mask\.(?:png|jpe?g|webp)$/i.test(filename(ref.url));
+}
+function drawThingsMaskImagesForRequest(refs){
+    return (refs || []).filter(ref => ref?.url && drawThingsReferenceIsMask(ref));
+}
+function drawThingsInputImagesForRequest(refs){
+    return (refs || []).filter(ref => ref?.url && !drawThingsReferenceIsMask(ref));
+}
 function drawThingsReferenceImagesForRequest(node, refs, runSettings){
     const references = (refs || []).filter(ref => ref?.url);
     // 非编辑模型也支持标准单图图生图；当前节点上一轮输出因此必须保留为
@@ -2526,7 +2555,7 @@ function drawThingsReferenceImagesForRequest(node, refs, runSettings){
 function drawThingsReferenceError(runSettings, refs){
     if(!isDrawThingsProvider(runSettings?.provider_id)) return '';
     if(drawThingsModelSupportsEditing(runSettings?.model)) return '';
-    return (refs || []).filter(ref => ref?.url).length > 1
+    return drawThingsInputImagesForRequest(refs).length > 1
         ? tr('smart.errDrawThingsMultiImage')
         : '';
 }
@@ -2587,9 +2616,17 @@ function drawThingsCachePayload(payload, options={}){
     });
     const stableReferences = referenceImages.map(ref => ({
         url:drawThingsCacheUrlKey(ref?.url),
+        ...(drawThingsReferenceIsMask(ref) ? {role:'mask'} : {}),
         ...(Number.isFinite(Number(ref?.weight)) ? {weight:Number(ref.weight)} : {})
     }));
-    return {...payload, reference_images:stableReferences};
+    const stableMasks = Array.isArray(payload.mask_images)
+        ? payload.mask_images.map(ref => ({
+            url:drawThingsCacheUrlKey(ref?.url),
+            role:'mask',
+            ...(Number.isFinite(Number(ref?.weight)) ? {weight:Number(ref.weight)} : {})
+        })).filter(ref => ref.url)
+        : payload.mask_images;
+    return {...payload, reference_images:stableReferences, mask_images:stableMasks};
 }
 function drawThingsCacheUrlKey(url){
     const value = String(url || '').trim();
@@ -13533,7 +13570,10 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
     const filteredDefaultImages = (hasOverrideImages ? overrideDefaultImages : defaultReferenceImagesFor(node, consumeDefault, ctx))
         .filter(img => !blockedRefs.has(inputRefKey(img)));
     const defaultRefs = uniqueReferenceImages(filteredDefaultImages);
-    const refs = defaultRefs.map((img, index) => ({...img, role:`image_${index + 1}`}));
+    const refs = defaultRefs.map((img, index) => ({
+        ...img,
+        role:drawThingsReferenceIsMask(img) ? 'mask' : `image_${index + 1}`
+    }));
     let hasMentionToken = false;
     const refMap = new Map();
     refs.forEach((img, index) => refMap.set(img.url, index + 1));
@@ -13556,7 +13596,15 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
                 return;
             }
             refMap.set(part.url, refs.length + 1);
-            refs.push({url:part.url, name:part.name || `图${refs.length + 1}`, nodeId:part.nodeId, imageIndex:part.imageIndex, kind:part.kind || 'image', asset_uris:part.asset_uris || {}, role:`image_${refs.length + 1}`});
+            refs.push({
+                url:part.url,
+                name:part.name || `图${refs.length + 1}`,
+                nodeId:part.nodeId,
+                imageIndex:part.imageIndex,
+                kind:part.kind || 'image',
+                asset_uris:part.asset_uris || {},
+                role:drawThingsReferenceIsMask(part) ? 'mask' : `image_${refs.length + 1}`
+            });
         }
         body += `图${refMap.get(part.url)}`;
     });
@@ -13573,14 +13621,14 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
         return {
             prompt:`${tr('smart.refMapHeader')}\n${mapText}\n\n${tr('smart.refUserNeed')}\n${body}`,
             displayPrompt,
-            refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', nodeId:img.nodeId || '', imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+            refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', nodeId:img.nodeId || '', imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:drawThingsReferenceIsMask(img) ? 'mask' : `image_${index + 1}`})),
             mentioned:true
         };
     }
     return {
         prompt:body,
         displayPrompt,
-        refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', nodeId:img.nodeId || '', imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+        refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, mediaInstanceId:img.mediaInstanceId || '', nodeId:img.nodeId || '', imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:drawThingsReferenceIsMask(img) ? 'mask' : `image_${index + 1}`})),
         mentioned:false
     };
 }
@@ -15382,7 +15430,16 @@ async function runApiGeneration(prompt, refs, runSettings=settings, cacheOptions
     const loras = drawThingsSelected ? selectedDrawThingsLoras(runSettings) : [];
     const loraCompatibility = drawThingsSelected ? drawThingsLoraCompatibility(runSettings) : '';
     if(loraCompatibility) throw new Error(loraCompatibility);
-    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : ''), resolution:['1k','2k','4k'].includes(runSettings.resolution) ? runSettings.resolution : '', quality:runSettings.quality || 'auto', n:1, batch_size:drawThingsBatchSize, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX), loras};
+    const drawThingsRefs = drawThingsSelected
+        ? drawThingsReferenceImagesForRequest(null, refs, runSettings)
+        : imageRefsOnly(refs);
+    const payloadReferences = drawThingsSelected
+        ? drawThingsInputImagesForRequest(drawThingsRefs)
+        : drawThingsRefs;
+    const payloadMasks = drawThingsSelected
+        ? drawThingsMaskImagesForRequest(drawThingsRefs)
+        : [];
+    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), aspect_ratio:API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : ''), resolution:['1k','2k','4k'].includes(runSettings.resolution) ? runSettings.resolution : '', quality:runSettings.quality || 'auto', n:1, batch_size:drawThingsBatchSize, reference_images:payloadReferences.slice(0, SMART_REFERENCE_IMAGE_MAX), mask_images:payloadMasks.slice(0, 1), loras};
     const cachePayload = drawThingsSelected ? drawThingsCachePayload(payload, cacheOptions) : payload;
     const fixedSeedState = drawThingsSelected && runSettings.drawThingsSeedRandom === false
         ? {provider:'drawthings', seed:normalizeDrawThingsSeed(runSettings.drawThingsSeed)}
