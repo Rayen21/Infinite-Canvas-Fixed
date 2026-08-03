@@ -84,23 +84,27 @@ def _build_configuration(
     seed: int | None = None,
     strength: float | None = None,
     batch_size: int = 1,
+    loras: list[dict] | None = None,
 ) -> bytes:
     import flatbuffers
     from generated import config_generated
 
     model_name = str(model or "").lower()
+    is_klein_9b = "flux_2_klein_9b" in model_name
+    is_klein_4b = "flux_2_klein_4b" in model_name
     is_klein = "klein" in model_name
     is_z_image = "z_image" in model_name or "zimage" in model_name
     config = config_generated.GenerationConfigurationT()
     config.model = model
     config.startWidth = width // 64
     config.startHeight = height // 64
-    default_steps = "4"
+    default_steps = "8" if (is_z_image or is_klein_9b) else "4"
     config.steps = int(os.getenv("DRAW_THINGS_GRPC_STEPS", default_steps))
     default_guidance = "1.0" if (is_klein or is_z_image) else "3.5"
     config.guidanceScale = float(
         os.getenv("DRAW_THINGS_GRPC_GUIDANCE", default_guidance)
     )
+    config.strength = 1.0
     if seed is not None:
         # The canvas dice control supplies an explicit seed for this request.
         config.seed = int(seed) % 4294967295
@@ -116,26 +120,46 @@ def _build_configuration(
             config.seed = int(configured_seed) % 4294967295
     config.batchCount = 1
     config.batchSize = max(1, min(8, int(batch_size or 1)))
+    config.loras = []
+    for item in loras or []:
+        if not isinstance(item, dict):
+            continue
+        file_name = str(item.get("file") or "").strip()
+        if not file_name:
+            continue
+        try:
+            weight = float(item.get("weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        lora = config_generated.LoRAT()
+        lora.file = file_name
+        lora.weight = max(-5.0, min(5.0, weight))
+        lora.mode = 0
+        config.loras.append(lora)
     if strength is not None:
         # Draw Things uses strength for image-to-image denoising. Keep it in
         # the same [0, 1] range exposed by the ComfyUI plugin.
         config.strength = max(0.0, min(1.0, float(strength)))
     if is_klein:
-        # FLUX.2 Klein's known-good Draw Things setup is 4-step DDIM Trailing
-        # with CFG 1, ScaleAlike seeds, shift 3, and no resolution shift.
+        # FLUX.2 Klein uses model-specific Draw Things presets.
         config.sampler = 16  # SamplerType.DDIMTrailing
         config.seedMode = 2  # SeedMode.ScaleAlike
         config.shift = 3.0
         config.resolutionDependentShift = False
+        if is_klein_9b:
+            config.maskBlur = 1.5
+        elif is_klein_4b:
+            config.maskBlur = 2.5
         config.speedUpWithGuidanceEmbed = True
         config.guidanceEmbed = 3.5
     elif is_z_image:
-        # Z Image Turbo's official Draw Things setup uses UniPC Trailing,
-        # ScaleAlike seeds, shift 3, and resolution-independent shift.
+        # Z Image Turbo uses the official eight-step Draw Things setup.
         config.sampler = 17  # SamplerType.UniPCTrailing
         config.seedMode = 2  # SeedMode.ScaleAlike
         config.shift = 3.0
         config.resolutionDependentShift = False
+        config.speedUpWithGuidanceEmbed = False
+        config.guidanceEmbed = 0.0
 
     builder = flatbuffers.Builder(0)
     builder.Finish(config.Pack(builder))
@@ -199,6 +223,27 @@ def _resize_crop_reference(image, width: int, height: int):
     return resized.crop((left, top, left + width, top + height))
 
 
+def _resize_crop_mask(image, width: int, height: int):
+    """Resize a mask without losing alpha or introducing soft edges."""
+    from PIL import Image
+
+    if "A" in image.getbands():
+        background = Image.new("RGBA", image.size, (0, 0, 0, 255))
+        image = Image.alpha_composite(background, image.convert("RGBA"))
+    image = image.convert("L")
+    if image.size == (width, height):
+        return image
+    source_width, source_height = image.size
+    scale = max(width / source_width, height / source_height)
+    resized = image.resize(
+        (max(width, int(source_width * scale)), max(height, int(source_height * scale))),
+        Image.Resampling.NEAREST,
+    )
+    left = max(0, (resized.width - width) // 2)
+    top = max(0, (resized.height - height) // 2)
+    return resized.crop((left, top, left + width, top + height))
+
+
 def _encode_image_for_request(reference: object, width: int, height: int) -> bytes:
     """Encode a local image as Draw Things' RGB NHWC FP16 tensor."""
     import numpy as np
@@ -227,6 +272,38 @@ def _encode_image_for_request(reference: object, width: int, height: int) -> byt
         3,
     )
     encoded[68:] = pixels.astype(np.float16, copy=False).tobytes(order="C")
+    return bytes(encoded)
+
+
+def _encode_mask_for_request(reference: object, width: int, height: int) -> bytes:
+    """Encode a black/white mask as Draw Things' NCHW 8-bit tensor."""
+    from PIL import Image
+
+    raw = _reference_image_bytes(reference)
+    with Image.open(io.BytesIO(raw)) as source:
+        image = _resize_crop_mask(source, width, height)
+
+    # Draw Things uses 0 for retained pixels and 2 for pixels redrawn with
+    # the configured img2img strength. This matches the ComfyUI node's mask
+    # conversion and keeps the mask separate from request.image.
+    encoded = bytearray(68 + width * height)
+    struct.pack_into(
+        "<9I",
+        encoded,
+        0,
+        0,
+        0x1,       # CCV_TENSOR_CPU_MEMORY
+        0x01,      # CCV_TENSOR_FORMAT_NCHW
+        0x1000,    # CCV_8U
+        0,
+        height,
+        width,
+        0,
+        0,
+    )
+    for y in range(height):
+        for x in range(width):
+            encoded[68 + y * width + x] = 2 if image.getpixel((x, y)) >= 50 else 0
     return bytes(encoded)
 
 
@@ -337,13 +414,7 @@ def _channel(target: str, use_tls: bool):
 
 
 def _model_files(echo_reply) -> list[str]:
-    import json
-
-    try:
-        raw_models = bytes(echo_reply.override.models or b"")
-        models = json.loads(raw_models.decode("utf-8")) if raw_models else []
-    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
-        models = []
+    models = _metadata_items(echo_reply, "models")
 
     # Older/newer server builds may expose the model browser as EchoReply.files
     # instead of MetadataOverride.models. Keep both forms compatible.
@@ -363,6 +434,46 @@ def _model_files(echo_reply) -> list[str]:
     return files
 
 
+def _metadata_items(echo_reply, field: str) -> list[object]:
+    """Decode a Draw Things MetadataOverride JSON field."""
+    import json
+
+    try:
+        raw_value = bytes(getattr(echo_reply.override, field, b"") or b"")
+        if not raw_value:
+            return []
+        try:
+            decoded = json.loads(raw_value.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            decoded = json.loads(
+                base64.b64decode(raw_value.strip(), validate=True).decode("utf-8")
+            )
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        decoded = []
+    return decoded if isinstance(decoded, list) else []
+
+
+def _metadata_files(items: list[object]) -> list[dict]:
+    """Keep the metadata shape used by the Draw Things model browser."""
+    normalized = []
+    seen = set()
+    for item in items:
+        if isinstance(item, str):
+            file_name = item.strip()
+            value = {"file": file_name, "name": file_name}
+        elif isinstance(item, dict):
+            file_name = str(item.get("file") or "").strip()
+            value = dict(item)
+            value["file"] = file_name
+            value.setdefault("name", file_name)
+        else:
+            continue
+        if file_name and file_name not in seen:
+            seen.add(file_name)
+            normalized.append(value)
+    return normalized
+
+
 async def list_draw_things_models(endpoint: str = "") -> dict:
     """Read the live model list exposed by gRPCServerCLI's model browser."""
     import grpc
@@ -377,9 +488,13 @@ async def list_draw_things_models(endpoint: str = "") -> dict:
             if shared_secret:
                 echo_request.sharedSecret = shared_secret
             reply = await stub.Echo(echo_request, timeout=10)
+            model_metadata = _metadata_files(_metadata_items(reply, "models"))
+            loras = _metadata_files(_metadata_items(reply, "loras"))
             return {
                 "connected": True,
                 "models": _model_files(reply),
+                "model_metadata": model_metadata,
+                "loras": loras,
                 "host": host,
                 "port": port,
             }
@@ -387,6 +502,8 @@ async def list_draw_things_models(endpoint: str = "") -> dict:
         return {
             "connected": False,
             "models": [],
+            "model_metadata": [],
+            "loras": [],
             "host": host,
             "port": port,
             "error": (
@@ -406,9 +523,11 @@ async def generate_draw_things_image(
     seed: int | None = None,
     strength: float | None = None,
     hint_images: list[dict] | None = None,
+    mask_images: list[dict] | None = None,
     hint_type: str = "shuffle",
     hint_weights: list[object] | None = None,
     batch_size: int = 1,
+    loras: list[dict] | None = None,
 ) -> tuple[dict, dict]:
     """Generate one image and return the project's standard image item shape."""
     import grpc
@@ -419,6 +538,11 @@ async def generate_draw_things_image(
         raise RuntimeError(
             "当前 Draw Things 模型不支持多图图像编辑，请只保留一张输入图，或切换到 Klein/Qwen Edit 模型。"
         )
+    masks = [item for item in (mask_images or []) if item]
+    if len(masks) > 1:
+        raise RuntimeError("当前 Draw Things 请求只支持一张遮罩图。")
+    if masks and not references:
+        raise RuntimeError("Draw Things 遮罩需要与一张输入图一起使用。")
     hints = [item for item in (hint_images or []) if item]
     if references and hints:
         raise RuntimeError(
@@ -439,11 +563,16 @@ async def generate_draw_things_image(
         # Ordinary image-to-image is carried by request.image. It must remain
         # separate from HintProto, which is reserved for later control inputs.
         input_image = _encode_image_for_request(references[0], width, height)
-        image_strength = _parse_strength(
-            strength
-            if strength is not None
-            else os.getenv("DRAW_THINGS_GRPC_STRENGTH", "0.75")
-        )
+        if strength is not None:
+            image_strength = _parse_strength(strength)
+        else:
+            configured_strength = os.getenv("DRAW_THINGS_GRPC_STRENGTH")
+            if configured_strength is None or not configured_strength.strip():
+                # Infinite-Canvas always supplies a prompt for image edits;
+                # use Draw Things' full-strength edit configuration.
+                configured_strength = "1.0"
+            image_strength = _parse_strength(configured_strength)
+    mask_image = _encode_mask_for_request(masks[0], width, height) if masks else None
     request_hints = _build_hint_protos(
         hints,
         width,
@@ -469,6 +598,7 @@ async def generate_draw_things_image(
             request = imageService_pb2.ImageGenerationRequest(
                 image=input_image or b"",
                 scaleFactor=1,
+                mask=mask_image or b"",
                 hints=request_hints,
                 prompt=str(prompt or ""),
                 negativePrompt="",
@@ -479,6 +609,7 @@ async def generate_draw_things_image(
                     seed,
                     strength=image_strength,
                     batch_size=batch_size,
+                    loras=loras,
                 ),
                 user="Infinite-Canvas",
                 device=imageService_pb2.LAPTOP,
@@ -510,6 +641,7 @@ async def generate_draw_things_image(
                 "width": width,
                 "height": height,
                 "image_to_image": bool(input_image),
+                "masked": bool(mask_image),
                 "strength": image_strength,
                 "hint_type": str(hint_type or "").strip().lower() if hints else "",
                 "hint_count": len(hints),
