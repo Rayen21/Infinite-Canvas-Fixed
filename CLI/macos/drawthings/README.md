@@ -2,6 +2,10 @@
 
 这是 Infinite-Canvas 的 Draw Things gRPCServerCLI 独立依赖说明，仅适用于 macOS Apple Silicon（M 芯片）。Draw Things gRPCServerCLI 需要由用户单独启动，Infinite-Canvas 只负责连接已运行的服务。
 
+Draw Things gRPCServerCLI 借助了
+https://github.com/drawthingsai/draw-things-comfyui.git 这个comfyui插件代码的能力。
+
+当前版本已将 Draw Things gRPC 所需的协议文件和客户端代码放在本目录中，不再运行时调用或依赖 `draw-things-comfyui` 插件，也不需要启动 ComfyUI。只需在画布所使用的 Python 环境中安装下面列出的 Python 依赖。
 ## 安装gPRCServerCLI 
 以下是drawthings作者编译好的gPRCServerCLI执行文件下载地址
 https://github.com/drawthingsai/draw-things-community/releases  

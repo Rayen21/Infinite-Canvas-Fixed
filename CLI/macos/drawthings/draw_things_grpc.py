@@ -7,17 +7,10 @@ import io
 import os
 import secrets
 import struct
-import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_SRC = REPO_ROOT / "draw-things-comfyui" / "src"
-if str(PLUGIN_SRC) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_SRC))
-
-
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7859
 DEFAULT_SIZE = (1024, 1024)
@@ -87,7 +80,7 @@ def _build_configuration(
     loras: list[dict] | None = None,
 ) -> bytes:
     import flatbuffers
-    from generated import config_generated
+    from .generated import config_generated
 
     model_name = str(model or "").lower()
     is_klein_9b = "flux_2_klein_9b" in model_name
@@ -147,7 +140,7 @@ def _build_configuration(
         config.shift = 3.0
         config.resolutionDependentShift = False
         if is_klein_9b:
-            config.maskBlur = 1.5
+            config.maskBlur = 2.5
         elif is_klein_4b:
             config.maskBlur = 2.5
         config.speedUpWithGuidanceEmbed = True
@@ -158,6 +151,7 @@ def _build_configuration(
         config.seedMode = 2  # SeedMode.ScaleAlike
         config.shift = 3.0
         config.resolutionDependentShift = False
+        config.maskBlur = 2.5
         config.speedUpWithGuidanceEmbed = False
         config.guidanceEmbed = 0.0
 
@@ -196,7 +190,7 @@ def _reference_image_bytes(reference: object) -> bytes:
         candidates = (
             Path.cwd() / path,
             Path(__file__).resolve().parent / path,
-            REPO_ROOT / path,
+            PROJECT_ROOT / path,
         )
         path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     try:
@@ -206,7 +200,7 @@ def _reference_image_bytes(reference: object) -> bytes:
 
 
 def _resize_crop_reference(image, width: int, height: int):
-    """Match draw-things-comfyui's resize-then-center-crop behavior."""
+    """Match Draw Things' resize-then-center-crop behavior."""
     from PIL import Image
 
     image = image.convert("RGB")
@@ -254,8 +248,8 @@ def _encode_image_for_request(reference: object, width: int, height: int) -> byt
         image = _resize_crop_reference(source, width, height)
         pixels = np.asarray(image, dtype=np.float32) / 255.0 * 2.0 - 1.0
 
-    # This is the same 68-byte CCV header and HWC FP16 payload used by the
-    # draw-things-comfyui plugin. It is an image input, not a HintProto.
+    # This is Draw Things' 68-byte CCV header and HWC FP16 image payload.
+    # It is an image input, not a HintProto.
     encoded = bytearray(68 + width * height * 3 * 2)
     struct.pack_into(
         "<9I",
@@ -336,10 +330,10 @@ def _build_hint_protos(
     """Build one HintProto from one or more local images.
 
     Draw Things expects all images belonging to one control type inside the
-    same HintProto. This mirrors draw-things-comfyui's request construction
-    and keeps ordinary request.image input separate from Hint inputs.
+    same HintProto. Keep ordinary request.image input separate from Hint
+    inputs while constructing the request from the local protocol types.
     """
-    from generated import imageService_pb2
+    from .generated import imageService_pb2
 
     normalized_type = str(hint_type or "").strip().lower()
     if not normalized_type:
@@ -402,7 +396,7 @@ def _decode_response_image(response_image: bytes) -> bytes:
 
 def _channel(target: str, use_tls: bool):
     import grpc
-    from credentials import credentials
+    from .credentials import credentials
 
     options = [
         ("grpc.max_send_message_length", -1),
@@ -477,7 +471,7 @@ def _metadata_files(items: list[object]) -> list[dict]:
 async def list_draw_things_models(endpoint: str = "") -> dict:
     """Read the live model list exposed by gRPCServerCLI's model browser."""
     import grpc
-    from generated import imageService_pb2, imageService_pb2_grpc
+    from .generated import imageService_pb2, imageService_pb2_grpc
 
     host, port, use_tls, shared_secret = _settings(endpoint)
     target = f"{host}:{port}"
@@ -531,7 +525,7 @@ async def generate_draw_things_image(
 ) -> tuple[dict, dict]:
     """Generate one image and return the project's standard image item shape."""
     import grpc
-    from generated import imageService_pb2, imageService_pb2_grpc
+    from .generated import imageService_pb2, imageService_pb2_grpc
 
     references = [item for item in (reference_images or []) if item]
     if len(references) > 1:

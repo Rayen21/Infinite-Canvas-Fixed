@@ -11248,7 +11248,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     if is_tudou_provider(provider):
         model = tudou_image_model_for_request(model)
     if is_draw_things_provider(provider):
-        from draw_things_grpc import draw_things_model_supports_editing
+        from CLI.macos.drawthings.draw_things_grpc import draw_things_model_supports_editing
 
         drawthings_references = []
         drawthings_masks = []
@@ -11306,7 +11306,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 detail="遮罩需要与一张输入图一起使用。",
             )
         try:
-            from draw_things_grpc import generate_draw_things_image
+            from CLI.macos.drawthings.draw_things_grpc import generate_draw_things_image
             # The provider's saved host:port overrides environment defaults.
             request_options = {
                 "endpoint": provider.get("base_url") or "",
@@ -13679,7 +13679,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
         }
     if protocol == "grpc":
         try:
-            from draw_things_grpc import list_draw_things_models
+            from CLI.macos.drawthings.draw_things_grpc import list_draw_things_models
             result = await list_draw_things_models(payload.base_url)
         except Exception as exc:
             result = {"connected": False, "models": [], "error": str(exc)}
@@ -13944,7 +13944,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
         return payload
     if protocol == "grpc":
         try:
-            from draw_things_grpc import list_draw_things_models
+            from CLI.macos.drawthings.draw_things_grpc import list_draw_things_models
             result = await list_draw_things_models(base_url)
         except Exception as exc:
             result = {"connected": False, "models": [], "error": str(exc)}
