@@ -8812,7 +8812,7 @@ def public_media_url_suffix() -> str:
 
 def local_asset_public_url(value: str) -> str:
     text = str(value or "").strip()
-    if not text.startswith(("/output/", "/assets/")):
+    if not text.startswith(("/output/", "/assets/", "/api/storage-files/")):
         return ""
     if not output_file_from_url(text):
         return ""
@@ -8856,6 +8856,36 @@ async def openai_video_proxy_public_reference_url(ref) -> str:
             detail=f"参考图上传图床失败，无法转成公网 URL：{upload_error[:200] or '未知错误'}。请检查网络后重试。"
         )
     raise HTTPException(status_code=400, detail=f"参考图不是公网 URL，无法传给上游：{text[:160]}")
+
+def local_media_reference_path(ref_url: str) -> str:
+    """将画布引用中的本机 URL 还原为后端可读取的本地媒体 URL。"""
+    text = str(ref_url or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme in {"http", "https"}:
+        host = (parsed.hostname or "").lower()
+        is_local_host = (
+            host in {"127.0.0.1", "localhost", "::1"}
+            or re.match(r"^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)", host)
+            or host.endswith(".local")
+        )
+        if not is_local_host:
+            return ""
+        text = urllib.parse.unquote(parsed.path or "")
+        if parsed.path == "/api/media-preview":
+            nested = urllib.parse.parse_qs(parsed.query).get("url", [""])[0]
+            text = urllib.parse.unquote(nested or "")
+    elif parsed.scheme == "file":
+        text = urllib.parse.unquote(parsed.path or "")
+    elif parsed.scheme:
+        return ""
+    if parsed.path == "/api/media-preview":
+        nested = urllib.parse.parse_qs(parsed.query).get("url", [""])[0]
+        text = urllib.parse.unquote(nested or "")
+    if text.startswith(("/output/", "/assets/", "/api/storage-files/")):
+        return text
+    return ""
 
 def openai_video_proxy_local_image_path(ref) -> str:
     raw = ref.get("url", "") if isinstance(ref, dict) else ref
@@ -9448,11 +9478,12 @@ def local_media_path_for_cloud_upload(ref_url: str, allowed_prefixes=("image/", 
     ref_url = str(ref_url or "").strip()
     if not ref_url:
         raise HTTPException(status_code=400, detail="没有可上传的媒体文件")
-    if ref_url.startswith("http://") or ref_url.startswith("https://"):
-        return ""
-    if not (ref_url.startswith("/output/") or ref_url.startswith("/assets/")):
+    local_ref = local_media_reference_path(ref_url) or ref_url
+    if not local_ref.startswith(("/output/", "/assets/", "/api/storage-files/")):
+        if ref_url.startswith(("http://", "https://")):
+            return ""
         raise HTTPException(status_code=400, detail="云端上传只支持画布里的本地图片或视频文件")
-    path = output_file_from_url(ref_url)
+    path = output_file_from_url(local_ref)
     if not path:
         raise HTTPException(status_code=404, detail="本地媒体文件不存在或已被删除")
     ct = content_type_for_path(path)
@@ -9507,20 +9538,92 @@ async def upload_video_to_temp_sh(path: str, source_url: str) -> Dict[str, str]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Temp.sh 上传异常：{exc}") from exc
 
+async def upload_media_to_uguu(path: str, source_url: str) -> Dict[str, str]:
+    upload_url = os.getenv("UGUU_UPLOAD_URL", "https://uguu.se/upload.php").strip() or "https://uguu.se/upload.php"
+    ct = content_type_for_path(path)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=600.0, write=600.0, pool=20.0), follow_redirects=True) as client:
+            with open(path, "rb") as fh:
+                files = {"files[]": (os.path.basename(path), fh, ct)}
+                response = await client.post(upload_url, files=files)
+        if not response.is_success:
+            raise HTTPException(status_code=response.status_code, detail=f"Uguu 上传失败：{response.text[:300]}")
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Uguu 返回了非 JSON 响应：{response.text[:300]}") from exc
+        items = payload.get("files") if isinstance(payload, dict) else None
+        direct_url = str((items[0] if isinstance(items, list) and items else {}).get("url") or "").strip()
+        if not re.match(r"^https?://", direct_url, re.I):
+            raise HTTPException(status_code=502, detail=f"Uguu 返回了无法识别的链接：{str(payload)[:300]}")
+        return {"url": direct_url, "source": source_url, "name": os.path.basename(path), "expires": "temporary", "service": "uguu"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Uguu 上传异常：{exc}") from exc
+
+async def verify_public_media_url(url: str, expected_content_type: str = "") -> Dict[str, str]:
+    parsed = urllib.parse.urlsplit(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=502, detail="上传服务返回的不是有效公网 URL")
+    expected = str(expected_content_type or "").lower().split(";", 1)[0].strip()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0),
+            follow_redirects=True,
+            headers={"User-Agent": "Infinite-Canvas/1.0"},
+        ) as client:
+            async with client.stream("GET", str(url).strip()) as response:
+                if not response.is_success:
+                    raise HTTPException(status_code=502, detail=f"公网媒体返回 HTTP {response.status_code}")
+                content_type = str(response.headers.get("content-type") or "").lower().split(";", 1)[0].strip()
+                if expected.startswith("image/"):
+                    supported = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+                    if content_type not in supported:
+                        raise HTTPException(status_code=502, detail=f"公网地址返回的不是可用图片（Content-Type: {content_type or '未知'}）")
+                elif expected.startswith("video/") and not content_type.startswith("video/"):
+                    raise HTTPException(status_code=502, detail=f"公网地址返回的不是可用视频（Content-Type: {content_type or '未知'}）")
+                first_chunk = b""
+                async for chunk in response.aiter_bytes():
+                    first_chunk += chunk
+                    if len(first_chunk) >= 32:
+                        break
+                if expected.startswith("image/") and not first_chunk:
+                    raise HTTPException(status_code=502, detail="公网地址返回了空图片")
+                return {"content_type": content_type, "status": str(response.status_code), "host": parsed.hostname or ""}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"公网媒体地址无法访问：{exc}") from exc
+
 async def upload_local_video_to_cloud(ref_url: str, service: str = "auto") -> Dict[str, str]:
     ref_url = str(ref_url or "").strip()
-    if ref_url.startswith("http://") or ref_url.startswith("https://"):
+    local_ref = local_media_reference_path(ref_url)
+    if local_ref:
+        ref_url = local_ref
+    elif ref_url.startswith(("http://", "https://")):
         return {"url": ref_url, "source": ref_url, "service": "existing"}
     path = local_media_path_for_cloud_upload(ref_url)
-    service = str(service or os.getenv("CLOUD_VIDEO_UPLOAD_SERVICE", "auto") or "auto").strip().lower()
-    if service in {"litterbox", "catbox"}:
-        return await upload_video_to_litterbox(path, ref_url)
-    if service in {"temp", "temp.sh", "tempsh"}:
-        return await upload_video_to_temp_sh(path, ref_url)
+    requested_service = str(service or "").strip().lower()
+    service = requested_service if requested_service not in {"", "auto"} else str(os.getenv("CLOUD_VIDEO_UPLOAD_SERVICE", "auto") or "auto").strip().lower()
+    uploaders = {
+        "uguu": upload_media_to_uguu,
+        "litterbox": upload_video_to_litterbox,
+        "catbox": upload_video_to_litterbox,
+        "temp": upload_video_to_temp_sh,
+        "temp.sh": upload_video_to_temp_sh,
+        "tempsh": upload_video_to_temp_sh,
+    }
+    if service in uploaders:
+        result = await uploaders[service](path, ref_url)
+        result.update(await verify_public_media_url(result.get("url", ""), content_type_for_path(path)))
+        return result
     errors = []
-    for name, func in (("litterbox", upload_video_to_litterbox), ("temp.sh", upload_video_to_temp_sh)):
+    for name, func in (("uguu", upload_media_to_uguu), ("litterbox", upload_video_to_litterbox), ("temp.sh", upload_video_to_temp_sh)):
         try:
-            return await func(path, ref_url)
+            result = await func(path, ref_url)
+            result.update(await verify_public_media_url(result.get("url", ""), content_type_for_path(path)))
+            return result
         except HTTPException as exc:
             errors.append(f"{name}: {exc.detail}")
     raise HTTPException(status_code=502, detail="云端上传失败：" + "；".join(errors))
@@ -15055,13 +15158,55 @@ def agnes_video_frame_count(duration, fps=24):
     return min(441, max(9, 8 * n + 1)), frame_rate
 
 async def agnes_video_image_url(ref):
-    url = str(getattr(ref, "url", "") or "").strip()
+    if isinstance(ref, dict):
+        url = str(ref.get("url", "") or "").strip()
+        original_urls = [ref.get("originalLocalUrl", ""), ref.get("original_url", ""), ref.get("source_url", "")]
+    else:
+        url = str(getattr(ref, "url", "") or "").strip()
+        original_urls = [getattr(ref, "originalLocalUrl", ""), getattr(ref, "original_url", ""), getattr(ref, "source_url", "")]
     if not url:
         return ""
-    if url.startswith("http://") or url.startswith("https://"):
-        return url
-    uploaded = await upload_local_video_to_cloud(url, "auto")
-    return uploaded.get("url") or ""
+
+    local_ref = ""
+    for value in original_urls:
+        local_ref = local_media_reference_path(value)
+        if local_ref:
+            break
+    local_ref = local_ref or local_media_reference_path(url)
+    remote_error = ""
+    if url.startswith(("http://", "https://")):
+        try:
+            await verify_public_media_url(url, "image/png")
+            return url
+        except HTTPException as exc:
+            remote_error = str(exc.detail)
+
+    if local_ref:
+        upload_error = ""
+        try:
+            uploaded = await upload_local_video_to_cloud(local_ref, "auto")
+            uploaded_url = str((uploaded or {}).get("url") or "").strip()
+            if uploaded_url.startswith(("http://", "https://")):
+                return uploaded_url
+        except HTTPException as exc:
+            upload_error = str(exc.detail)
+        public_url = local_asset_public_url(local_ref)
+        if public_url:
+            try:
+                await verify_public_media_url(public_url, "image/png")
+                return public_url
+            except HTTPException as exc:
+                upload_error = f"{upload_error or '云端上传失败'}；公网回源地址无效：{exc.detail}"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agnes 参考图无法转成可下载的公网图片：{upload_error[:200] or remote_error[:200] or '云端上传失败'}。请检查网络后重试。"
+        )
+
+    if url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail=f"Agnes 参考图公网地址无效：{remote_error[:240] or '无法下载图片'}")
+    if url.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="Agnes 图生视频暂不接受 data:image；请使用画布中的本地图片或公网图片 URL")
+    raise HTTPException(status_code=400, detail=f"Agnes 参考图地址无法识别：{url[:160]}")
 
 async def wait_for_agnes_video_task(client, provider, video_id, model):
     base_url = video_api_root(provider)

@@ -10496,7 +10496,13 @@ function generatedImageRefs(node){
             const url = outputUrlValue(item);
             if(!url) return null;
             const kind = mediaKindForOutputItem(item);
-            return {url, name:outputImageName(url) || `${node.type || 'generated'}-${i + 1}`, kind, index:i};
+            return {
+                url,
+                name:outputImageName(url) || `${node.type || 'generated'}-${i + 1}`,
+                kind,
+                originalLocalUrl:item?.originalLocalUrl || '',
+                index:i
+            };
         })
         .filter(Boolean)
         .filter(ref => keepGeneratedMedia || ref.kind === 'image')
@@ -10509,20 +10515,20 @@ function mediaRefsFromNode(node){
     if(!node) return [];
     if(node.type === 'image' && node.url){
         const kind = mediaKindForNode(node);
-        return [{url:node.url, name:node.name || kind, role:node.role || '', kind}];
+        return [{url:node.url, name:node.name || kind, role:node.role || '', kind, originalLocalUrl:node.originalLocalUrl || ''}];
     }
     if(node.type === 'group'){
         return (node.items || [])
             .map(id => nodes.find(x => x.id === id))
             .filter(x => x?.type === 'image' && x?.url)
-            .map(item => ({url:item.url, name:item.name || mediaKindForNode(item), role:item.role || '', kind:mediaKindForNode(item)}));
+            .map(item => ({url:item.url, name:item.name || mediaKindForNode(item), role:item.role || '', kind:mediaKindForNode(item), originalLocalUrl:item.originalLocalUrl || ''}));
     }
     if(node.type === 'output'){
         return (node.images || []).map((item, i) => {
             const url = outputUrlValue(item);
             if(!url) return null;
             const kind = mediaKindForOutputItem(item);
-            return {url, name:outputImageName(url) || `output-${i + 1}`, kind, nodeId:node.id, outputIndex:i};
+            return {url, name:outputImageName(url) || `output-${i + 1}`, kind, originalLocalUrl:item?.originalLocalUrl || '', nodeId:node.id, outputIndex:i};
         }).filter(Boolean);
     }
     if(CANVAS_MEDIA_OUTPUT_TYPES.includes(node.type)) return generatedImageRefs(node);
@@ -10537,7 +10543,7 @@ function generatorSources(gen){
             if(found){
                 const last = outputUrlValue(found.item);
                 const kind = mediaKindForOutputItem(found.item);
-                return {id:n.id, type:'outputImage', label:'上游输出', preview:last, refs:[{url:last, name:'output.png', kind, nodeId:n.id, outputIndex:found.index}], prompt:''};
+                return {id:n.id, type:'outputImage', label:'上游输出', preview:last, refs:[{url:last, name:'output.png', kind, originalLocalUrl:found.item?.originalLocalUrl || '', nodeId:n.id, outputIndex:found.index}], prompt:''};
             }
         }
         if(CANVAS_MEDIA_OUTPUT_TYPES.includes(n.type)){
@@ -10555,7 +10561,7 @@ function generatorSources(gen){
         }
         if(n.type === 'image' && n.url) {
             const kind = mediaKindForNode(n);
-            return {id:n.id, type:kind, label:n.name || kind, preview:n.url, refs:[{url:n.url, name:n.name || kind, role:n.role || '', kind}], prompt:''};
+            return {id:n.id, type:kind, label:n.name || kind, preview:n.url, refs:[{url:n.url, name:n.name || kind, role:n.role || '', kind, originalLocalUrl:n.originalLocalUrl || ''}], prompt:''};
         }
         if(n.type === 'group') {
             const items = (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean);
@@ -10566,7 +10572,7 @@ function generatorSources(gen){
                 imageId:img.id,
                 label:img.name || mediaKindForNode(img),
                 preview:img.url,
-                refs:[{url:img.url, name:img.name || mediaKindForNode(img), role:img.role || '', kind:mediaKindForNode(img)}],
+                refs:[{url:img.url, name:img.name || mediaKindForNode(img), role:img.role || '', kind:mediaKindForNode(img), originalLocalUrl:img.originalLocalUrl || ''}],
                 prompt:''
             }));
             const prompts = items.filter(x => x.type === 'prompt').map(p => p.text || '').filter(Boolean);

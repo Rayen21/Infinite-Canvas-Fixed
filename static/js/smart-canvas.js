@@ -15577,6 +15577,8 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
         };
         const refImages = imageRefsOnly(uploadedRefs).map((ref, i) => {
             const item = {url:effUrl(ref), name:ref.name || `图${i + 1}`};
+            const originalLocalUrl = ref.originalLocalUrl || ref.sourceUrl || '';
+            if(originalLocalUrl) item.originalLocalUrl = originalLocalUrl;
             if(runSettings.videoUseFrameRoles){
                 if(i === 0) item.role = 'first_frame';
                 else if(i === 1) item.role = 'last_frame';
