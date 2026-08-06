@@ -80,7 +80,7 @@ const MS_BUILTIN_IMAGE_MODELS = [
     'black-forest-labs/FLUX.2-klein-9B'
 ];
 const MS_DEFAULT_BASE_URL = 'https://api-inference.modelscope.cn/v1';
-const RH_DEFAULT_BASE_URL = 'https://www.runninghub.cn';
+const RH_DEFAULT_BASE_URL = 'https://www.runninghub.ai';
 const LINGJING_DEFAULT_BASE_URL = 'https://apistudio.vip';
 const LINGJING_REGISTER_URL = 'https://apistudio.vip/register?aff=g1CT';
 const VIP_GPT_DEFAULT_BASE_URL = 'https://www.vip-gpt.net';
@@ -116,14 +116,10 @@ const ONBOARDING_GUIDES = {
     runninghub:{
         titleKey:'api.rhOnboardingTitle',
         descKey:'api.rhOnboardingDesc',
-        primaryLabelKey:'api.rhGetKeyCn',
-        secondaryLabelKey:'api.rhGetKeyGlobal',
-        primaryUrl:'https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=rh-v1331',
-        secondaryUrl:'https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=rh-v1331',
-        walletPrimaryLabelKey:'api.rhGetWalletKeyCn',
-        walletSecondaryLabelKey:'api.rhGetWalletKeyGlobal',
-        walletPrimaryUrl:'https://www.runninghub.cn/enterprise-api/sharedApi?inviteCode=rh-v1331',
-        walletSecondaryUrl:'https://www.runninghub.ai/enterprise-api/sharedApi?inviteCode=rh-v1331'
+        primaryLabelKey:'api.rhGetKeyGlobal',
+        primaryUrl:'https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=rh-v1331',
+        walletPrimaryLabelKey:'api.rhGetWalletKeyGlobal',
+        walletPrimaryUrl:'https://www.runninghub.ai/enterprise-api/sharedApi?inviteCode=rh-v1331'
     },
     lingjing:{
         titleKey:'api.lingjingOnboardingTitle',
@@ -132,6 +128,10 @@ const ONBOARDING_GUIDES = {
         primaryUrl:LINGJING_REGISTER_URL
     }
 };
+function normalizeRunningHubBaseUrl(value){
+    const url = String(value || '').trim().replace(/\/+$/, '');
+    return url || RH_DEFAULT_BASE_URL;
+}
 function applyCliProtocolDefaults(item, protocol){
     if(!item) return;
     const value = String(protocol || item.protocol || '').toLowerCase();
@@ -231,8 +231,7 @@ const RECOMMENDED_APIS = [
         base_url:RH_DEFAULT_BASE_URL,
         protocol:'runninghub',
         image_request_mode:'openai',
-        register_url:ONBOARDING_GUIDES.runninghub.secondaryUrl,
-        register_url_cn:ONBOARDING_GUIDES.runninghub.primaryUrl,
+        register_url:ONBOARDING_GUIDES.runninghub.primaryUrl,
         tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels','api.tagSeedance'],
         icons:['IMG','VID','LLM'],
         summaryKey:'api.recommendRunninghubSummary',
@@ -698,7 +697,6 @@ function renderProviderOnboarding(item){
                             <div class="onboarding-rh-source-label">${escapeHtml(tr('api.rhCoinKey'))}</div>
                             <div class="onboarding-key-actions onboarding-rh-key-actions">
                                 <a class="onboarding-key-btn" href="${escapeAttr(guide.primaryUrl)}" target="_blank" rel="noopener noreferrer"><i data-lucide="coins" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr(guide.primaryLabelKey))}</span></a>
-                                <a class="onboarding-key-btn" href="${escapeAttr(guide.secondaryUrl)}" target="_blank" rel="noopener noreferrer"><i data-lucide="globe-2" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr(guide.secondaryLabelKey))}</span></a>
                             </div>
                         </div>
                         <div class="recommend-flow-arrow onboarding-flow-arrow onboarding-rh-row-arrow" aria-hidden="true"><span></span><b></b></div>
@@ -712,7 +710,6 @@ function renderProviderOnboarding(item){
                             <div class="onboarding-rh-source-label">${escapeHtml(tr('api.rhWalletKey'))}</div>
                             <div class="onboarding-key-actions onboarding-rh-key-actions">
                                 <a class="onboarding-key-btn" href="${escapeAttr(guide.walletPrimaryUrl)}" target="_blank" rel="noopener noreferrer"><i data-lucide="wallet" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr(guide.walletPrimaryLabelKey))}</span></a>
-                                <a class="onboarding-key-btn" href="${escapeAttr(guide.walletSecondaryUrl)}" target="_blank" rel="noopener noreferrer"><i data-lucide="globe-2" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr(guide.walletSecondaryLabelKey))}</span></a>
                             </div>
                         </div>
                         <div class="recommend-flow-arrow onboarding-flow-arrow onboarding-rh-row-arrow" aria-hidden="true"><span></span><b></b></div>
@@ -758,7 +755,7 @@ function applyProviderOnboardingDefaults(id){
         item.chat_models = unique([...(item.chat_models || [])]);
         item.ms_defaults_version = Math.max(3, Number(item.ms_defaults_version || 0));
     } else if(id === 'runninghub'){
-        item.base_url = RH_DEFAULT_BASE_URL;
+        item.base_url = normalizeRunningHubBaseUrl(item.base_url);
         item.protocol = 'runninghub';
         item.image_models = unique(item.image_models || []);
         item.chat_models = unique(item.chat_models || []);
@@ -814,7 +811,13 @@ function syncEditor(){
         : item.id === 'drawthings'
         ? 'grpc'
         : (protocolInput?.value || 'openai');
-    item.base_url = selectedProtocol === 'grpc' ? (baseInput.value.trim() || DRAW_THINGS_DEFAULT_ENDPOINT) : CLI_PROTOCOLS.has(selectedProtocol) ? '' : baseInput.value.trim();
+    item.base_url = CLI_PROTOCOLS.has(selectedProtocol)
+        ? ''
+        : selectedProtocol === 'runninghub'
+        ? normalizeRunningHubBaseUrl(baseInput.value)
+        : selectedProtocol === 'grpc'
+        ? (baseInput.value.trim() || DRAW_THINGS_DEFAULT_ENDPOINT)
+        : baseInput.value.trim();
     // 固定平台不从协议下拉读取
     item.protocol = selectedProtocol;
     item.image_request_mode = normalizeImageRequestMode(
@@ -2985,7 +2988,7 @@ function applyDetectedProtocol(protocol){
         item.volcengine_region = item.volcengine_region || VOLCENGINE_DEFAULT_REGION;
     }
     if(detected === 'runninghub'){
-        item.base_url = item.base_url || RH_DEFAULT_BASE_URL;
+        item.base_url = normalizeRunningHubBaseUrl(item.base_url);
         item.image_models = unique(item.image_models || []);
         item.chat_models = unique(item.chat_models || []);
         item.video_models = unique(item.video_models || []);
@@ -3210,7 +3213,7 @@ const RH_KNOWN_MODEL_LABELS = {
 };
 function isRunningHubLike(item){
     const base = String(item?.base_url || '').toLowerCase();
-    return item?.id === 'runninghub' || String(item?.protocol || '').toLowerCase() === 'runninghub' || base.includes('runninghub.cn');
+    return item?.id === 'runninghub' || String(item?.protocol || '').toLowerCase() === 'runninghub' || base.includes('runninghub.cn') || base.includes('runninghub.ai');
 }
 function rhActionLabel(text){
     const value = String(text || '').toLowerCase().replace(/[_/-]+/g, ' ');
@@ -3829,7 +3832,7 @@ async function saveProviders(){
             item.video_models = [];
         }
         if(item.id === 'runninghub'){
-            item.base_url = item.base_url || RH_DEFAULT_BASE_URL;
+            item.base_url = normalizeRunningHubBaseUrl(item.base_url);
             item.image_models = unique(item.image_models || []);
             item.chat_models = unique(item.chat_models || []);
             item.video_models = unique(item.video_models || []);
