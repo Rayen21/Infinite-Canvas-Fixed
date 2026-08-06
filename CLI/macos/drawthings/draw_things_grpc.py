@@ -92,7 +92,9 @@ def _build_configuration(
     config.model = model
     config.startWidth = width // 64
     config.startHeight = height // 64
-    default_steps = "8" if (is_z_image or is_klein_9b) else "4"
+    # Draw Things' Klein 9B preset uses four DDIM-trailing steps. Keeping it
+    # at eight steps doubles the diffusion work for the same request.
+    default_steps = "8" if is_z_image else "4"
     config.steps = int(os.getenv("DRAW_THINGS_GRPC_STEPS", default_steps))
     default_guidance = "1.0" if (is_klein or is_z_image or is_qwen_edit) else "3.5"
     config.guidanceScale = float(
