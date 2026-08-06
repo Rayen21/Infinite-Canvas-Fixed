@@ -2495,8 +2495,8 @@ function drawThingsLoraCompatibility(runSettings=settings){
     if(!currentFamily || !loraFamily || currentFamily === loraFamily) return '';
     return trf('smart.drawThingsLoraIncompatible', {model:currentFamily, lora:loraFamily});
 }
-async function refreshSmartDrawThingsModels(){
-    const provider = drawThingsProvider();
+async function refreshSmartDrawThingsModels(providerId=settings.provider_id){
+    const provider = drawThingsProvider(providerId);
     if(!provider) return;
     try {
         const data = await fetch('/api/drawthings/models').then(response => response.json());
@@ -4295,6 +4295,9 @@ function setDynamicSetting(key, value){
     persistActiveSmartSettings();
     rememberRecentSmartSettings(settings, activeSettingsSubject());
     if(layoutKeys.has(key)) renderDynamicParams();
+    if(key === 'provider_id' && isDrawThingsProvider(settings.provider_id)) {
+        void refreshSmartDrawThingsModels(settings.provider_id);
+    }
     scheduleSave();
 }
 function closeAllSmartPopovers(){
@@ -4317,7 +4320,12 @@ function bindDynamicParams(){
             const ctrl = pill.parentElement;
             const wasPinned = ctrl.classList.contains('pinned');
             closeAllSmartPopovers();
-            if(!wasPinned) ctrl.classList.add('pinned');
+            if(!wasPinned) {
+                ctrl.classList.add('pinned');
+                if(ctrl.classList.contains('drawthings-lora-control')) {
+                    void refreshSmartDrawThingsModels(settings.provider_id);
+                }
+            }
         };
     });
     dynamicParams.querySelectorAll('[data-smart-param]').forEach(btn => {
@@ -4565,7 +4573,8 @@ async function loadConfig(){
         // 提供商配置已就绪即先渲染参数面板，避免等工作流/RunningHub 预取完成后参数才「突然刷新出来」。
         sanitizeSmartApiSelection(settings);
         updateProviderModels();
-        if(apiProviders.some(provider => isDrawThingsProvider(provider.id))) void refreshSmartDrawThingsModels();
+        const drawThings = apiProviders.find(provider => isDrawThingsProvider(provider.id));
+        if(drawThings) void refreshSmartDrawThingsModels(drawThings.id);
         const wf = await fetch('/api/workflows').then(r => r.json()).catch(() => ({workflows:[]}));
         comfyWorkflows = Array.isArray(wf.workflows) ? wf.workflows : [];
         runningHubWorkflowCache = {};

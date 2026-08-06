@@ -87,13 +87,14 @@ def _build_configuration(
     is_klein_4b = "flux_2_klein_4b" in model_name
     is_klein = "klein" in model_name
     is_z_image = "z_image" in model_name or "zimage" in model_name
+    is_qwen_edit = "qwen" in model_name and "edit" in model_name
     config = config_generated.GenerationConfigurationT()
     config.model = model
     config.startWidth = width // 64
     config.startHeight = height // 64
     default_steps = "8" if (is_z_image or is_klein_9b) else "4"
     config.steps = int(os.getenv("DRAW_THINGS_GRPC_STEPS", default_steps))
-    default_guidance = "1.0" if (is_klein or is_z_image) else "3.5"
+    default_guidance = "1.0" if (is_klein or is_z_image or is_qwen_edit) else "3.5"
     config.guidanceScale = float(
         os.getenv("DRAW_THINGS_GRPC_GUIDANCE", default_guidance)
     )
@@ -154,6 +155,12 @@ def _build_configuration(
         config.maskBlur = 2.5
         config.speedUpWithGuidanceEmbed = False
         config.guidanceEmbed = 0.0
+    elif is_qwen_edit:
+        config.sampler = 17  # SamplerType.UniPCTrailing
+        config.seedMode = 2  # SeedMode.ScaleAlike
+        config.shift = 3.0
+        config.resolutionDependentShift = False
+        config.maskBlur = 2.5
 
     builder = flatbuffers.Builder(0)
     builder.Finish(config.Pack(builder))
