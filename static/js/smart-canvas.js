@@ -3397,7 +3397,7 @@ function renderComfyParams(){
             ${settings.editUpscale ? renderUpscalePill('editUpscaleRes', Number(settings.editUpscaleRes || 2048)) : ''}`;
     } else {
         const wf = comfyWorkflowCache[settings.comfyWorkflow];
-        const fields = (wf?.config?.fields || []).filter(f => comfyFieldKind(f) === 'setting');
+        const fields = (wf?.config?.fields || []).filter(f => comfyFieldKind(f) === 'setting' && !f.auto);
         html += renderComfyWorkflowControl();
         html += fields.length ? fields.map(renderComfySettingField).join('') : (settings.comfyWorkflow ? '' : `<div class="muted-note">${escapeHtml(tr('smart.noWorkflow'))}</div>`);
     }
@@ -16039,7 +16039,10 @@ async function generateComfyUrlsWithSettings(runSettings, prompt, refs){
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'video'), videoRefsOnly(allRefs));
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'audio'), audioRefsOnly(allRefs));
     fields.filter(f => comfyFieldKind(f) === 'setting').forEach(field => {
-        if(comfyRandomEnabledField(field) && smartComfyRandomActiveFor(runSettings, field.id)){
+        const autoValue = comfyAutoFieldValue(field, imageRefs.length);
+        if(autoValue !== undefined){
+            values[field.id] = autoValue;
+        } else if(comfyRandomEnabledField(field) && smartComfyRandomActiveFor(runSettings, field.id)){
             values[field.id] = smartComfyRandomValue(field);
         } else {
             values[field.id] = runSettings.comfyParams?.[field.id] ?? field.default;
@@ -16868,6 +16871,11 @@ async function runPromptLLMNode(nodeId){
         render();
     }
 }
+function comfyAutoFieldValue(field, imageCount=0){
+    if(field?.auto !== 'image_count') return undefined;
+    const minimum = Number(field.image_count_min ?? 1);
+    return imageCount >= (Number.isFinite(minimum) ? minimum : 1);
+}
 function comfyFieldKind(field){
     if(['image','video','audio'].includes(field?.type)) return field.type;
     const key = `${field?.input || ''} ${field?.name || ''}`.toLowerCase();
@@ -17252,7 +17260,10 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta, runSett
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'video'), videoRefsOnly(allRefs));
     await assignMediaFields(fields.filter(f => comfyFieldKind(f) === 'audio'), audioRefsOnly(allRefs));
     fields.filter(f => comfyFieldKind(f) === 'setting').forEach(field => {
-        if(comfyRandomEnabledField(field) && smartComfyRandomActiveFor(runSettings, field.id)){
+        const autoValue = comfyAutoFieldValue(field, refs.length);
+        if(autoValue !== undefined){
+            values[field.id] = autoValue;
+        } else if(comfyRandomEnabledField(field) && smartComfyRandomActiveFor(runSettings, field.id)){
             values[field.id] = smartComfyRandomValue(field);
         } else {
             values[field.id] = runSettings.comfyParams?.[field.id] ?? field.default;
