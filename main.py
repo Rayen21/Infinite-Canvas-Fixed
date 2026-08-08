@@ -593,9 +593,16 @@ AI_REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1800"))
 IMAGE_POLL_INTERVAL = float(os.getenv("IMAGE_POLL_INTERVAL", "2"))
 IMAGE_TASK_TIMEOUT = float(os.getenv("IMAGE_TASK_TIMEOUT", str(AI_REQUEST_TIMEOUT)))
 COMFYUI_HISTORY_TIMEOUT = int(float(os.getenv("COMFYUI_HISTORY_TIMEOUT", "1800")))
-# 下载 ComfyUI 产物的 socket 超时（秒，作用于连接和每次 read）。没有它时一次网络卡顿会让 urlopen 永久挂起，
-# 导致 generate() 不返回、画布卡片一直转圈拿不到结果。给得足够大以容纳大视频/大图的正常下载。
-COMFYUI_DOWNLOAD_TIMEOUT = float(os.getenv("COMFYUI_DOWNLOAD_TIMEOUT", "120"))
+# Cloudflare Access TCP 转发可能比局域网后端有更高的连接延迟，所有远端请求都必须有明确的单次超时。
+COMFYUI_BACKEND_CHECK_TIMEOUT = float(os.getenv("COMFYUI_BACKEND_CHECK_TIMEOUT", "5"))
+COMFYUI_HTTP_TIMEOUT = float(os.getenv("COMFYUI_HTTP_TIMEOUT", "30"))
+COMFYUI_HISTORY_REQUEST_TIMEOUT = float(os.getenv("COMFYUI_HISTORY_REQUEST_TIMEOUT", "15"))
+# 下载 ComfyUI 产物的 socket 超时（秒，作用于连接和每次 read）。结果通过 Cloudflare 隧道回传时，
+# 连接可能会短暂重置，因此下载层会自动重试，而不是直接把远端 URL 交给前端再次下载。
+COMFYUI_DOWNLOAD_TIMEOUT = float(os.getenv("COMFYUI_DOWNLOAD_TIMEOUT", "300"))
+COMFYUI_DOWNLOAD_RETRIES = max(1, int(float(os.getenv("COMFYUI_DOWNLOAD_RETRIES", "3"))))
+COMFYUI_DOWNLOAD_RETRY_DELAY = max(0.0, float(os.getenv("COMFYUI_DOWNLOAD_RETRY_DELAY", "1")))
+COMFYUI_UPLOAD_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_TIMEOUT", "60"))
 APIMART_IMAGE_TASK_TIMEOUT = float(os.getenv("APIMART_IMAGE_TASK_TIMEOUT", "1800"))
 APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"))
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
@@ -3223,7 +3230,7 @@ def check_images_exist(backend_addr, images):
     for img in images:
         try:
             url = f"http://{backend_addr}/view?filename={urllib.parse.quote(img)}&type=input"
-            r = requests.get(url, stream=True, timeout=0.5)
+            r = requests.get(url, stream=True, timeout=COMFYUI_BACKEND_CHECK_TIMEOUT)
             r.close()
             if r.status_code != 200: return False
         except: return False
@@ -3296,7 +3303,11 @@ def get_best_backend(required_images: List[str] = None):
 
     for addr in COMFYUI_INSTANCES:
         try:
-            with urllib.request.urlopen(f"http://{addr}/queue", timeout=1) as response:
+            request = urllib.request.Request(
+                f"http://{addr}/queue",
+                headers={"Connection": "close", "Cache-Control": "no-cache"},
+            )
+            with urllib.request.urlopen(request, timeout=COMFYUI_BACKEND_CHECK_TIMEOUT) as response:
                 data = json.loads(response.read())
                 remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
                 with LOAD_LOCK:
@@ -3323,7 +3334,11 @@ def reserve_best_backend(required_images: List[str] = None):
     backend_stats = {}
     for addr in COMFYUI_INSTANCES:
         try:
-            with urllib.request.urlopen(f"http://{addr}/queue", timeout=1) as response:
+            request = urllib.request.Request(
+                f"http://{addr}/queue",
+                headers={"Connection": "close", "Cache-Control": "no-cache"},
+            )
+            with urllib.request.urlopen(request, timeout=COMFYUI_BACKEND_CHECK_TIMEOUT) as response:
                 data = json.loads(response.read())
                 remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
                 has_images = check_images_exist(addr, required_images)
@@ -3345,13 +3360,78 @@ def reserve_best_backend(required_images: List[str] = None):
 
 # --- 辅助工具 ---
 
+def _download_comfy_file_atomic(full_url, local_path, validate_image=False, alternate_urls=None):
+    """Download a ComfyUI file atomically with retries for tunnel resets."""
+    directory = os.path.dirname(local_path) or "."
+    urls = [str(full_url)]
+    for alternate_url in alternate_urls or []:
+        if alternate_url and str(alternate_url) not in urls:
+            urls.append(str(alternate_url))
+    last_error = None
+
+    for attempt in range(COMFYUI_DOWNLOAD_RETRIES):
+        for url in urls:
+            temp_path = ""
+            try:
+                prefix = f".{os.path.basename(local_path)}."
+                fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".part", dir=directory)
+                total_bytes = 0
+                request = urllib.request.Request(
+                    url,
+                    headers={"Connection": "close", "Cache-Control": "no-cache"},
+                )
+                with os.fdopen(fd, "wb") as out_file:
+                    with urllib.request.urlopen(request, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response:
+                        expected_length = response.headers.get("Content-Length")
+                        try:
+                            expected_length = int(expected_length) if expected_length else None
+                        except (TypeError, ValueError):
+                            expected_length = None
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            out_file.write(chunk)
+                            total_bytes += len(chunk)
+                    out_file.flush()
+                    os.fsync(out_file.fileno())
+                if expected_length is not None and total_bytes != expected_length:
+                    raise IOError(
+                        f"ComfyUI 文件下载不完整：收到 {total_bytes} 字节，期望 {expected_length} 字节"
+                    )
+                if total_bytes <= 0:
+                    raise IOError("ComfyUI 返回了空文件")
+                if validate_image:
+                    with Image.open(temp_path) as image:
+                        image.verify()
+                os.replace(temp_path, local_path)
+                temp_path = ""
+                return
+            except Exception as exc:
+                last_error = exc
+            finally:
+                if temp_path:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+        if attempt + 1 < COMFYUI_DOWNLOAD_RETRIES:
+            time.sleep(COMFYUI_DOWNLOAD_RETRY_DELAY)
+
+    raise last_error or IOError("ComfyUI 文件下载失败")
+
 def download_image(comfy_address, comfy_url_path, prefix="studio_"):
     filename = f"{prefix}{uuid.uuid4().hex[:10]}.png"
     local_path = output_path_for(filename, "output")
     full_url = f"http://{comfy_address}{comfy_url_path}"
     try:
-        with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
+        alternate_url = full_url.replace("/view?", "/api/view?", 1)
+        _download_comfy_file_atomic(
+            full_url,
+            local_path,
+            validate_image=True,
+            alternate_urls=[alternate_url],
+        )
         return output_url_for(filename, "output")
     except Exception as e:
         print(f"下载图片失败: {e}")
@@ -3416,15 +3496,18 @@ def download_comfy_output(comfy_address, item, prefix="studio_"):
     file_type = urllib.parse.quote(str(item.get("type") or "output"))
     comfy_url_path = f"/view?filename={urllib.parse.quote(str(item['filename']))}&subfolder={subfolder}&type={file_type}"
     full_url = f"http://{comfy_address}{comfy_url_path}"
+    alternate_url = full_url.replace("/view?", "/api/view?", 1)
     try:
-        with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
+        _download_comfy_file_atomic(
+            full_url,
+            local_path,
+            validate_image=ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"},
+            alternate_urls=[alternate_url],
+        )
         return output_url_for(filename, "output")
     except Exception as e:
         print(f"下载 ComfyUI 输出失败: {e}")
-        if comfy_url_path.startswith("/view"):
-            return comfy_url_path.replace("/view", "/api/view", 1)
-        return full_url
+        raise RuntimeError(f"ComfyUI 输出回传失败：{e}") from e
 
 def save_comfy_text_output(value, prefix="studio_", name=""):
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
@@ -3507,7 +3590,11 @@ def save_to_history(record):
 
 def get_comfy_history(comfy_address, prompt_id):
     try:
-        with urllib.request.urlopen(f"http://{comfy_address}/history/{prompt_id}") as response:
+        request = urllib.request.Request(
+            f"http://{comfy_address}/history/{prompt_id}",
+            headers={"Connection": "close", "Cache-Control": "no-cache"},
+        )
+        with urllib.request.urlopen(request, timeout=COMFYUI_HISTORY_REQUEST_TIMEOUT) as response:
             return json.loads(response.read())
     except Exception as e:
         return {}
@@ -7054,10 +7141,7 @@ def smart_owned_result_items(images: List[Any], paths: List[str]) -> List[Any]:
         item for item in images
         if isinstance(item, dict)
         and item.get("loopInputPreview") is not True
-        and (
-            item.get("generatedResult") is True
-            or any(json_references_media_path(item, path) for path in paths)
-        )
+        and item.get("generatedResult") is True
     ]
 
 def expand_canvas_generated_media_paths(canvas: Dict[str, Any], paths: List[str]) -> List[str]:
@@ -12248,20 +12332,31 @@ async def upload_image(files: List[UploadFile] = File(...)):
     for file, content in files_content:
         success_count = 0
         last_result = None
+        upload_errors = []
         for addr in COMFYUI_INSTANCES:
             try:
                 files_data = {'image': (file.filename, content, file.content_type)}
-                response = requests.post(f"http://{addr}/upload/image", files=files_data, timeout=5)
+                response = requests.post(
+                    f"http://{addr}/upload/image",
+                    files=files_data,
+                    timeout=(10, COMFYUI_UPLOAD_TIMEOUT),
+                )
                 if response.status_code == 200:
                     last_result = response.json()
                     success_count += 1
+                else:
+                    upload_errors.append(f"{addr}: HTTP {response.status_code}")
             except Exception as e:
                 print(f"Upload error for {addr}: {e}")
+                upload_errors.append(f"{addr}: {e}")
 
         if success_count > 0 and last_result:
             uploaded_files.append({"comfy_name": last_result.get("name", file.filename)})
         else:
-            raise HTTPException(status_code=500, detail="Failed to upload to any backend")
+            detail = "Failed to upload to any backend"
+            if upload_errors:
+                detail += f": {'; '.join(upload_errors[:3])}"
+            raise HTTPException(status_code=502, detail=detail)
 
     return {"files": uploaded_files}
 
@@ -12304,8 +12399,7 @@ async def upload_ai_reference(files: List[UploadFile] = File(...)):
                 ext = ".bin"
         filename = f"ai_ref_{uuid.uuid4().hex[:12]}{ext}"
         path = output_path_for(filename, "input")
-        with open(path, "wb") as f:
-            f.write(content)
+        write_uploaded_content_atomic(path, content)
         uploaded.append({"url": output_url_for(filename, "input"), "name": file.filename or filename, "kind": kind, "mime": content_type})
     return {"files": uploaded}
 
@@ -12337,8 +12431,7 @@ async def upload_ai_base64(payload: Base64UploadRequest):
         kind, ext = "image", ".png"
     filename = f"ai_ref_{uuid.uuid4().hex[:12]}{ext}"
     path = output_path_for(filename, "input")
-    with open(path, "wb") as f:
-        f.write(content)
+    write_uploaded_content_atomic(path, content)
     return {"files": [{"url": output_url_for(filename, "input"), "name": payload.name or filename, "kind": kind}]}
 
 @app.post("/api/comfyui/upload-base64")
@@ -12390,6 +12483,25 @@ def _local_upload_kind_ext(filename, content_type):
             ext = ".jpg" if "jpeg" in ct else ".webp" if "webp" in ct else ".gif" if "gif" in ct else ".png"
         return "image", ext
     return None, ext
+
+def write_uploaded_content_atomic(path: str, content: bytes):
+    directory = os.path.dirname(path) or "."
+    prefix = f".{os.path.basename(path)}."
+    temp_path = ""
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".part", dir=directory)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = ""
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 def _local_upload_display_name(filename):
     # 文件名形如 up_<hex>_<原始名>；去掉前缀还原展示名
@@ -17866,7 +17978,6 @@ async def delete_canvas_log(canvas_id: str, payload: DeleteCanvasLogRequest):
 
             reset_node_ids = []
             if payload.reset_referencing_nodes and candidate_paths:
-                candidate_paths = expand_canvas_generated_media_paths(canvas, candidate_paths)
                 reset_node_ids = reset_canvas_result_nodes_for_media(canvas, candidate_paths)
 
             canvas["logs"] = [item for item in logs if str(item.get("id") or "") != log_id]
@@ -18854,14 +18965,24 @@ def generate(req: GenerateRequest):
         p = {"prompt": workflow, "client_id": CLIENT_ID}
         data = json.dumps(p).encode('utf-8')
         try:
-            post_req = urllib.request.Request(f"http://{target_backend}/prompt", data=data)
-            prompt_id = json.loads(urllib.request.urlopen(post_req, timeout=10).read())['prompt_id']
+            post_req = urllib.request.Request(
+                f"http://{target_backend}/prompt",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Connection": "close",
+                },
+            )
+            prompt_id = json.loads(
+                urllib.request.urlopen(post_req, timeout=COMFYUI_HTTP_TIMEOUT).read()
+            )['prompt_id']
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
             raise Exception(comfy_prompt_error_message(e.code, error_body))
 
         history_data = None
-        for i in range(COMFYUI_HISTORY_TIMEOUT):
+        history_deadline = time.monotonic() + COMFYUI_HISTORY_TIMEOUT
+        while time.monotonic() < history_deadline:
             try:
                 res = get_comfy_history(target_backend, prompt_id)
                 if prompt_id in res:
@@ -18869,7 +18990,7 @@ def generate(req: GenerateRequest):
                     break
             except Exception:
                 pass
-            time.sleep(1)
+            time.sleep(min(1, max(0, history_deadline - time.monotonic())))
 
         if not history_data:
             raise Exception("ComfyUI 渲染超时")
@@ -19005,6 +19126,8 @@ class WorkflowField(BaseModel):
     step: Optional[float] = None
     options: List[str] = []
     random_enabled: bool = False
+    auto: str = ""
+    image_count_min: Optional[int] = None
 
 class WorkflowConfig(BaseModel):
     title: str = ""
