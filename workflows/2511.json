@@ -2,6 +2,7 @@
   "1": {
     "inputs": {
       "strength": 1,
+      "pre_cfg": false,
       "model": [
         "2",
         0
@@ -28,12 +29,6 @@
   "3": {
     "inputs": {
       "prompt": "",
-      "speak_and_recognation": {
-        "__value__": [
-          false,
-          true
-        ]
-      },
       "clip": [
         "87",
         0
@@ -71,12 +66,6 @@
   "11": {
     "inputs": {
       "prompt": "将摄像机向右旋转45度",
-      "speak_and_recognation": {
-        "__value__": [
-          false,
-          true
-        ]
-      },
       "clip": [
         "87",
         0
@@ -242,7 +231,7 @@
   },
   "86": {
     "inputs": {
-      "unet_name": "qwen_image_edit_2511_fp8_e4m3fn.safetensors",
+      "unet_name": "qwen_image_edit_2511_int8_convrot.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",

@@ -4570,7 +4570,14 @@ function bindDynamicParams(){
         btn.onclick = event => {
             event.preventDefault();
             event.stopPropagation();
-            settings.drawThingsSeedRandom = !(settings.drawThingsSeedRandom !== false);
+            const wasRandom = settings.drawThingsSeedRandom !== false;
+            if(wasRandom){
+                const input = dynamicParams.querySelector('[data-drawthings-seed]');
+                settings.drawThingsSeed = normalizeDrawThingsSeed(input?.value ?? settings.drawThingsSeed);
+                settings.drawThingsSeedRandom = false;
+            } else {
+                settings.drawThingsSeedRandom = true;
+            }
             persistActiveSmartSettings();
             renderDynamicParams();
             scheduleSave();
@@ -16900,6 +16907,7 @@ function applyDrawThingsSeedResult(taskResult, runSettings=settings, restoreSett
     if(!randomMode) return normalizeDrawThingsSeed(runSettings.drawThingsSeed);
     runSettings.drawThingsSeed = actualSeed;
     if(restoreSettings && isDrawThingsProvider(restoreSettings.provider_id)) restoreSettings.drawThingsSeed = actualSeed;
+    const lockedDuringRun = targetNode?.runSettings?.drawThingsSeedRandom === false;
 
     // 优先写入本次任务的目标节点；级联运行时当前选中节点可能已经变化，不能依赖全局选择状态。
     const subjects = [targetNode].filter(Boolean);
@@ -16907,8 +16915,11 @@ function applyDrawThingsSeedResult(taskResult, runSettings=settings, restoreSett
     subjects.forEach(subject => {
         if(seen.has(subject.id) || !isDrawThingsProvider(subject.runSettings?.provider_id || runSettings.provider_id)) return;
         seen.add(subject.id);
-        subject.runSettings = settingsForStorage({...settingsForStorage(subject.runSettings || {}), drawThingsSeed:actualSeed, drawThingsSeedRandom:true});
+        subject.runSettings = settingsForStorage({...settingsForStorage(subject.runSettings || {}), drawThingsSeed:actualSeed, drawThingsSeedRandom:lockedDuringRun ? false : true});
     });
+    if(lockedDuringRun && restoreSettings && isDrawThingsProvider(restoreSettings.provider_id)) {
+        restoreSettings.drawThingsSeedRandom = false;
+    }
 
     // 只有用户仍选中本次运行目标时才刷新输入框，避免后台任务覆盖其他节点的参数。
     const activeSubject = activeSettingsSubject();

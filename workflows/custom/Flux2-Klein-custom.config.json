@@ -12,7 +12,9 @@
       "max": null,
       "step": null,
       "options": [],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "",
+      "image_count_min": null
     },
     {
       "id": "f_klein_image_1",
@@ -25,7 +27,9 @@
       "max": null,
       "step": null,
       "options": [],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "",
+      "image_count_min": null
     },
     {
       "id": "f_klein_image_2",
@@ -38,7 +42,9 @@
       "max": null,
       "step": null,
       "options": [],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "",
+      "image_count_min": null
     },
     {
       "id": "f_klein_image_3",
@@ -51,7 +57,9 @@
       "max": null,
       "step": null,
       "options": [],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "",
+      "image_count_min": null
     },
     {
       "id": "f_klein_multi_2",
@@ -60,13 +68,13 @@
       "name": "启用第二张输入图",
       "type": "boolean",
       "default": false,
-      "auto": "image_count",
-      "image_count_min": 2,
       "min": null,
       "max": null,
       "step": null,
       "options": [],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "image_count",
+      "image_count_min": 2
     },
     {
       "id": "f_klein_multi_3",
@@ -75,13 +83,13 @@
       "name": "启用第三张输入图",
       "type": "boolean",
       "default": false,
-      "auto": "image_count",
-      "image_count_min": 3,
       "min": null,
       "max": null,
       "step": null,
       "options": [],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "image_count",
+      "image_count_min": 3
     },
     {
       "id": "f_zbe4wlu",
@@ -94,13 +102,14 @@
       "max": null,
       "step": null,
       "options": [
-        "None",
         "Klein-W万物迁移.safetensors",
         "Flux2-Klein-9B-consistency-V2.safetensors",
         "realistic(Flux2-Klein-9B-Enhanced-Details).safetensors",
         "Klein2-9B-jhuangswap-SmartCharacterSwap.safetensors"
       ],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "",
+      "image_count_min": null
     },
     {
       "id": "f_m50c4ff",
@@ -113,7 +122,9 @@
       "max": 2.0,
       "step": 0.1,
       "options": [],
-      "random_enabled": false
+      "random_enabled": false,
+      "auto": "",
+      "image_count_min": null
     }
   ],
   "mini_cards": {

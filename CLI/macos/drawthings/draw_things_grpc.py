@@ -7,6 +7,7 @@ import io
 import os
 import secrets
 import struct
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -203,9 +204,41 @@ def _reference_image_bytes(reference: object) -> bytes:
         )
         path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     try:
-        return path.read_bytes()
+        last_data = b""
+        for attempt in range(3):
+            before = path.stat()
+            last_data = path.read_bytes()
+            after = path.stat()
+            if before.st_size == after.st_size == len(last_data):
+                return last_data
+            if attempt < 2:
+                time.sleep(0.05)
+        return last_data
     except OSError as exc:
         raise ValueError(f"参考图无法读取：{path}") from exc
+
+
+def _open_reference_image(reference: object, label: str):
+    from PIL import Image
+
+    raw = _reference_image_bytes(reference)
+    source_name = ""
+    if isinstance(reference, dict):
+        source_name = str(
+            reference.get("path")
+            or reference.get("url")
+            or reference.get("name")
+            or ""
+        ).strip()
+    try:
+        with Image.open(io.BytesIO(raw)) as source:
+            source.load()
+            return source.copy()
+    except OSError as exc:
+        raise ValueError(
+            f"{label}文件损坏或不完整：{source_name or '未知文件'}，"
+            f"读取到 {len(raw)} 字节；{exc}"
+        ) from exc
 
 
 def _resize_crop_reference(image, width: int, height: int):
@@ -252,10 +285,9 @@ def _encode_image_for_request(reference: object, width: int, height: int) -> byt
     import numpy as np
     from PIL import Image
 
-    raw = _reference_image_bytes(reference)
-    with Image.open(io.BytesIO(raw)) as source:
-        image = _resize_crop_reference(source, width, height)
-        pixels = np.asarray(image, dtype=np.float32) / 255.0 * 2.0 - 1.0
+    source = _open_reference_image(reference, "输入图")
+    image = _resize_crop_reference(source, width, height)
+    pixels = np.asarray(image, dtype=np.float32) / 255.0 * 2.0 - 1.0
 
     # This is Draw Things' 68-byte CCV header and HWC FP16 image payload.
     # It is an image input, not a HintProto.
@@ -282,9 +314,8 @@ def _encode_mask_for_request(reference: object, width: int, height: int) -> byte
     """Encode a black/white mask as Draw Things' NCHW 8-bit tensor."""
     from PIL import Image
 
-    raw = _reference_image_bytes(reference)
-    with Image.open(io.BytesIO(raw)) as source:
-        image = _resize_crop_mask(source, width, height)
+    source = _open_reference_image(reference, "遮罩图")
+    image = _resize_crop_mask(source, width, height)
 
     # Draw Things uses 0 for retained pixels and 2 for pixels redrawn with
     # the configured img2img strength. This matches the ComfyUI node's mask

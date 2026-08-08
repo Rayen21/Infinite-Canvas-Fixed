@@ -1,0 +1,92 @@
+{
+  "title": "klein9b-高清修复放大",
+  "fields": [
+    {
+      "id": "f_zbn0t1h",
+      "node": "113",
+      "input": "lora_name",
+      "name": "LoRA 模型",
+      "type": "dropdown",
+      "default": "f2k-9B_consis.safetensors",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [
+        "Klein一致性增强.safetensors",
+        "Flux2-Klein-9B-consistency-V2.safetensors",
+        "Klein-W万物迁移.safetensors"
+      ],
+      "random_enabled": false
+    },
+    {
+      "id": "f_zhmodo9",
+      "node": "113",
+      "input": "strength_model",
+      "name": "模型强度",
+      "type": "number",
+      "default": 0.5,
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "options": [],
+      "random_enabled": false
+    },
+    {
+      "id": "f_36dfth7",
+      "node": "96",
+      "input": "scale_by",
+      "name": "Latent缩放",
+      "type": "number",
+      "default": 1,
+      "min": 0.0,
+      "max": 8.0,
+      "step": 0.5,
+      "options": [],
+      "random_enabled": false
+    },
+    {
+      "id": "f_7zppojg",
+      "node": "93",
+      "input": "image",
+      "name": "图片",
+      "type": "image",
+      "default": "pasted/image (41).png",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    },
+    {
+      "id": "f_ry3p9ow",
+      "node": "64",
+      "input": "text",
+      "name": "提示词文本",
+      "type": "textarea",
+      "default": "高清修复",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    }
+  ],
+  "mini_cards": {
+    "prompt": {
+      "x": 24,
+      "y": 30
+    },
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    }
+  }
+}

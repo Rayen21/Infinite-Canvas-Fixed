@@ -60,9 +60,9 @@ function canvasMediaPreviewUrl(url, size=512){
 function canvasPreviewImgHtml(url, size=512, attrs=''){
     const original = canvasOriginalMediaUrl(url);
     const preview = canvasMediaPreviewUrl(original, size);
-    // loading=lazy：画布内容多时，视口外的缩略图不加载/不解码，避免一次性解码上百张图卡顿；
-    // decoding=async：解码放到主线程外，渲染时不阻塞。
-    return `<img loading="lazy" decoding="async" src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}"${attrs ? ` ${attrs}` : ''}>`;
+    const eager = /\bdata-eager-preview(?:\s|=|$)/.test(attrs || '');
+    // 画布内容多时默认懒加载；日志缩略图使用 data-eager-preview，避免弹窗内的缩略图被浏览器延迟加载。
+    return `<img loading="${eager ? 'eager' : 'lazy'}" decoding="async" src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}"${attrs ? ` ${attrs}` : ''}>`;
 }
 function loadCanvasOriginalImageDimensions(url){
     const src = String(url || '');
@@ -77,7 +77,8 @@ function loadCanvasOriginalImageDimensions(url){
 function canvasVideoPreviewHtml(url, size=512, attrs=''){
     const original = canvasOriginalMediaUrl(url);
     const preview = canvasMediaPreviewUrl(original, size);
-    return `<img loading="lazy" decoding="async" src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}" data-preview-kind="video"${attrs ? ` ${attrs}` : ''}>`;
+    const eager = /\bdata-eager-preview(?:\s|=|$)/.test(attrs || '');
+    return `<img loading="${eager ? 'eager' : 'lazy'}" decoding="async" src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}" data-preview-kind="video"${attrs ? ` ${attrs}` : ''}>`;
 }
 function canvasVideoFallbackHtml(url, attrs=''){
     const original = canvasOriginalMediaUrl(url);
@@ -3782,6 +3783,18 @@ function mediaKindForRef(ref){
 function imageRefsOnly(refs){
     return (refs || []).filter(ref => ref?.url && mediaKindForRef(ref) === 'image').slice(0, CANVAS_REFERENCE_IMAGE_MAX);
 }
+function canvasReferenceIsMask(ref){
+    if(!ref) return false;
+    if(ref.mask === true || ref.isMask === true || ref.is_mask === true || ref.maskImage === true || ref.mask_image === true) return true;
+    const values = [ref.role, ref.type, ref.kind, ref.mediaRole, ref.media_role, ref.maskType, ref.mask_type];
+    if(values.some(value => ['mask', 'inpaint_mask', 'inpainting_mask'].includes(String(value || '').trim().toLowerCase()))) return true;
+    const metadata = ref.metadata || ref.meta || {};
+    if(metadata && typeof metadata === 'object'){
+        if(metadata.mask === true || metadata.isMask === true || metadata.is_mask === true) return true;
+        if(['mask', 'inpaint_mask', 'inpainting_mask'].includes(String(metadata.role || metadata.type || metadata.kind || '').trim().toLowerCase())) return true;
+    }
+    return /(?:^|[_-])mask\.(?:png|jpe?g|webp)$/i.test(String(ref.name || ref.url || '').split(/[?#]/, 1)[0].split('/').pop() || '');
+}
 function videoRefsOnly(refs){
     return (refs || []).filter(ref => ref?.url && mediaKindForRef(ref) === 'video');
 }
@@ -5936,6 +5949,15 @@ function applyImageEdit(){
 function nodeHasLiveMedia(node){
     return node?.type === 'image' && node.url && ['video','audio'].includes(mediaKindForNode(node));
 }
+function nodeHasStableImagePreview(node){
+    return node?.type === 'image' && node.url && mediaKindForNode(node) === 'image';
+}
+function stableImagePreviewMatches(el, node){
+    if(!el || !nodeHasStableImagePreview(node)) return false;
+    const img = el.querySelector?.('img[data-url], img[data-original-src]');
+    const currentUrl = img?.dataset?.originalSrc || img?.dataset?.url || '';
+    return currentUrl === canvasOriginalMediaUrl(node.url);
+}
 function captureMediaPlaybackState(media){
     if(!media) return null;
     return {
@@ -6021,29 +6043,44 @@ function measureCanvasOriginalImageNodes(root=nodesEl){
 function render(){
     const outputScrolls = captureOutputScrolls();
     const mediaStates = captureMediaPlaybackStates();
-    const reusableMediaNodes = new Map();
+    const existingNodes = new Map();
+    const reusableNodes = new Map();
     nodesEl.querySelectorAll('.node').forEach(el => {
+        if(el.dataset?.id) existingNodes.set(el.dataset.id, el);
         const node = nodes.find(n => n.id === el.dataset.id);
-        if(nodeHasLiveMedia(node)) reusableMediaNodes.set(node.id, el);
+        if(nodeHasLiveMedia(node) || nodeHasStableImagePreview(node)) reusableNodes.set(node.id, el);
     });
     applyViewport();
-    [...nodesEl.children].forEach(child => {
-        if(!reusableMediaNodes.has(child.dataset?.id)) child.remove();
-    });
+    const renderedElements = new Set();
     nodes.forEach(node => {
         // 单个节点渲染异常不能中断整个循环，否则它后面的节点（含新建节点，通常排在末尾）都不会被
         // 追加进 DOM，连带这些节点的连线也会因找不到 DOM 而画到 (0,0) 变成“消失”。
         try {
-            const fresh = renderNode(node);
-            const old = reusableMediaNodes.get(node.id);
-            nodesEl.appendChild(fresh);
-            if(old){
-                transplantNodeMediaElement(old, fresh);
-                if(old !== fresh) old.remove();
+            const reusable = reusableNodes.get(node.id);
+            if(reusable && (nodeHasLiveMedia(node) || stableImagePreviewMatches(reusable, node))){
+                nodesEl.appendChild(reusable);
+                renderedElements.add(reusable);
+                return;
             }
+            const fresh = renderNode(node);
+            const old = existingNodes.get(node.id);
+            nodesEl.appendChild(fresh);
+            if(old && old !== fresh){
+                transplantNodeMediaElement(old, fresh);
+                old.remove();
+            }
+            renderedElements.add(fresh);
         } catch(err){
             console.error('[canvas] renderNode 失败，已跳过该节点：', node?.id, node?.type, err);
+            const old = existingNodes.get(node.id);
+            if(old){
+                nodesEl.appendChild(old);
+                renderedElements.add(old);
+            }
         }
+    });
+    [...nodesEl.children].forEach(child => {
+        if(!renderedElements.has(child)) child.remove();
     });
     restoreMediaPlaybackStates(mediaStates);
     restoreOutputScrolls(outputScrolls);
@@ -12807,7 +12844,8 @@ async function runComfyNode(nodeId, opts={}){
     const sources = orderedSources(node, generatorSources(node));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const allRefs = sources.flatMap(s => s.refs || []);
-    const refs = imageRefsOnly(allRefs);
+    const comfyMaskRefs = allRefs.filter(canvasReferenceIsMask);
+    const refs = imageRefsOnly(allRefs).filter(ref => !canvasReferenceIsMask(ref));
     const mode = node.mode || 'text';
     const customImageFields = mode === 'custom' ? comfyFields(node, 'image') : [];
     const customVideoFields = mode === 'custom' ? comfyFields(node, 'video') : [];
@@ -12817,6 +12855,9 @@ async function runComfyNode(nodeId, opts={}){
     if((mode !== 'text' && mode !== 'custom' && !refs.length) || (mode === 'custom' && refs.length < customImageFields.length)){ alert(tr('canvas.needImage')); return; }
     if(mode === 'custom' && videoRefsOnly(allRefs).length < customVideoFields.length){ alert(langIsEn() ? 'Please connect enough video inputs for this ComfyUI workflow.' : '请为这个 ComfyUI 工作流连接足够的视频输入'); return; }
     if(mode === 'custom' && audioRefsOnly(allRefs).length < customAudioFields.length){ alert(langIsEn() ? 'Please connect enough audio inputs for this ComfyUI workflow.' : '请为这个 ComfyUI 工作流连接足够的音频输入'); return; }
+    if(comfyMaskRefs.length && mode !== 'custom'){
+        setStatus(langIsEn() ? 'The current ComfyUI workflow has no mask input; the mask will be ignored.' : '当前 ComfyUI 工作流没有遮罩输入，遮罩不会生效。');
+    }
     let out = outputForNode(node, 480);
     const pendingId = uid('p');
     const run = runSnapshot(node, prompt, refs);
@@ -13544,7 +13585,9 @@ function formatRunDuration(ms){
 }
 function nowMs(){ return Date.now(); }
 function outputUrlValue(item){
-    return typeof item === 'string' ? item : item?.url || '';
+    if(typeof item === 'string') return item;
+    if(!item || typeof item !== 'object') return '';
+    return item.url || item.path || item.src || item.uri || item.output_url || item.outputUrl || '';
 }
 function isMissingAssetUrl(url){
     return Boolean(url && missingAssetUrls.has(url));
@@ -13669,16 +13712,23 @@ function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
     if(!error && (outputs || []).some(item => outputUrlValue(item))) playGenerationCompleteSound();
+    const normalizedOutputs = (outputs || []).map(item => {
+        const url = outputUrlValue(item);
+        if(!url) return null;
+        if(typeof item === 'object' && item.url === url) return item;
+        return {url, kind:mediaKindForOutputItem(item), name:item?.name || item?.filename || ''};
+    }).filter(Boolean);
     const entry = {
         id:uid('log'),
         createdAt:Date.now(),
         status:error ? 'failed' : 'success',
+        nodeId:run?.node?.id || run?.nodeId || '',
         platform:runPlatformLabel(run),
         nodeType:run?.nodeType || '',
         model:run?.taskLabel || runTaskLabel(run),
         request:run?.request || {},
         prompt:run?.prompt || '',
-        outputs:(outputs || []).filter(Boolean),
+        outputs:normalizedOutputs,
         refs:run?.refs || [],
         runMs:Number(runMs || 0),
         error:error ? String(error) : '',
@@ -13690,13 +13740,16 @@ function renderCanvasLog(){
     const logs = (typeof canvas !== 'undefined' && Array.isArray(canvas?.logs)) ? canvas.logs : [];
     if(!list) return;
     list.innerHTML = logs.length ? logs.map(log => {
-        const thumbs = (log.outputs || []).slice(0, 8).map(item => {
+        const logOutputs = Array.isArray(log.outputs) && log.outputs.length
+            ? log.outputs
+            : (Array.isArray(log.items) ? log.items : (Array.isArray(log.images) ? log.images : []));
+        const thumbs = logOutputs.slice(0, 8).map(item => {
             const url = outputUrlValue(item);
             if(!url) return '';
             const safe = escapeAttr(url);
             if(isMissingAssetUrl(url)) return `<div class="missing-asset compact" data-url="${safe}"><i data-lucide="image-off" class="w-4 h-4"></i></div>`;
             const kind = mediaKindForOutputItem(item);
-            return kind === 'video' ? canvasVideoPreviewHtml(url, 256, 'alt="output"') : canvasPreviewImgHtml(url, 256, 'alt="output"');
+            return kind === 'video' ? canvasVideoPreviewHtml(url, 256, 'alt="output" data-eager-preview="1"') : canvasPreviewImgHtml(url, 256, 'alt="output" data-eager-preview="1"');
         }).join('');
         const date = new Date(log.createdAt || Date.now()).toLocaleString(window.StudioI18n?.lang() === 'en' ? 'en-US' : 'zh-CN');
         const req = log.request || {};
@@ -13709,7 +13762,7 @@ function renderCanvasLog(){
         const backendText = workflow || backend || '';
         const subParts = [
             date,
-            `${langIsEn() ? 'outputs' : '输出'} ${(log.outputs || []).length}`,
+            `${langIsEn() ? 'outputs' : '输出'} ${logOutputs.length}`,
             idText ? `ID ${idText}` : '',
             backendText,
         ].filter(Boolean);

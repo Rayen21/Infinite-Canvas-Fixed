@@ -29,7 +29,7 @@
     "inputs": {
       "cfg": 1,
       "model": [
-        "296",
+        "320",
         0
       ],
       "positive": [
@@ -238,15 +238,9 @@
   },
   "168": {
     "inputs": {
-      "text": "改为夜晚",
-      "speak_and_recognation": {
-        "__value__": [
-          false,
-          true
-        ]
-      },
+      "text": "",
       "clip": [
-        "295",
+        "316",
         0
       ]
     },
@@ -384,33 +378,6 @@
       "title": "图像按像素缩放"
     }
   },
-  "295": {
-    "inputs": {
-      "model_name1": "qwen_3_8b_fp8mixed.safetensors",
-      "model_name2": "None",
-      "model_name3": "None",
-      "type": "stable_diffusion",
-      "key_opt": "",
-      "mode": "Auto",
-      "device": "default"
-    },
-    "class_type": "LoadTextEncoderShared //Inspire",
-    "_meta": {
-      "title": "Shared Text Encoder Loader (Inspire)"
-    }
-  },
-  "296": {
-    "inputs": {
-      "model_name": "flux-2-klein-9b-fp8.safetensors",
-      "weight_dtype": "default",
-      "key_opt": "",
-      "mode": "Auto"
-    },
-    "class_type": "LoadDiffusionModelShared //Inspire",
-    "_meta": {
-      "title": "Shared Diffusion Model Loader (Inspire)"
-    }
-  },
   "305": {
     "inputs": {
       "switch": [
@@ -520,6 +487,41 @@
     "class_type": "SaveImage",
     "_meta": {
       "title": "保存图像"
+    }
+  },
+  "316": {
+    "inputs": {
+      "clip_name": "Qwen3-8B-int4-ConvRot.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "317": {
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-int8-ConvRot-comfyui.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "320": {
+    "inputs": {
+      "lora_name": "Klein一致性增强.safetensors",
+      "strength_model": 0.5,
+      "model": [
+        "317",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器（仅模型）"
     }
   }
 }
