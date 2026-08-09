@@ -584,9 +584,9 @@ async def generate_draw_things_image(
     if masks and not references:
         raise RuntimeError("Draw Things 遮罩需要与一张输入图一起使用。")
     hints = [item for item in (hint_images or []) if item]
-    if references and hints:
+    if references and hints and not editing_model:
         raise RuntimeError(
-            "Draw Things gRPC 请求不能同时使用普通图生图 image 和 Hint 输入。"
+            "当前 Draw Things 非编辑模型不能同时使用普通图生图 image 和 Hint 输入。"
         )
 
     host, port, use_tls, shared_secret = _settings(endpoint)

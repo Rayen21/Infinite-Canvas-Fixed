@@ -11650,10 +11650,21 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             if drawthings_masks:
                 # Draw Things masks belong to ImageGenerationRequest.mask and
                 # must not be counted as a second ordinary reference image.
-                request_options.update(
-                    reference_images=drawthings_references,
-                    mask_images=drawthings_masks,
-                )
+                # For an editing model, the first image is the masked base
+                # image and the remaining references stay in the HintProto
+                # stack, matching the official Draw Things ComfyUI node.
+                if editing_model and len(drawthings_references) > 1:
+                    request_options.update(
+                        reference_images=drawthings_references[:1],
+                        hint_images=drawthings_references[1:],
+                        hint_type="shuffle",
+                        mask_images=drawthings_masks,
+                    )
+                else:
+                    request_options.update(
+                        reference_images=drawthings_references,
+                        mask_images=drawthings_masks,
+                    )
             elif editing_model:
                 request_options.update(
                     hint_images=drawthings_references,
