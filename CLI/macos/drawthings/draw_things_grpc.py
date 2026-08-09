@@ -567,10 +567,16 @@ async def generate_draw_things_image(
     import grpc
     from .generated import imageService_pb2, imageService_pb2_grpc
 
-    references = [item for item in (reference_images or []) if item]
-    if len(references) > 1:
+    selected_model = str(model or "").strip()
+    if not selected_model:
         raise RuntimeError(
-            "当前 Draw Things 模型不支持多图图像编辑，请只保留一张输入图，或切换到 Klein/Qwen Edit 模型。"
+            "Draw Things gRPCServerCLI 未选择模型。请连接服务后从实时模型列表中选择。"
+        )
+    editing_model = draw_things_model_supports_editing(selected_model)
+    references = [item for item in (reference_images or []) if item]
+    if len(references) > 1 and not editing_model:
+        raise RuntimeError(
+            "当前 Draw Things 模型不支持多图图像编辑，请只保留一张输入图，或切换到支持多图编辑的 Klein/Qwen Edit 模型。"
         )
     masks = [item for item in (mask_images or []) if item]
     if len(masks) > 1:
@@ -585,11 +591,6 @@ async def generate_draw_things_image(
 
     host, port, use_tls, shared_secret = _settings(endpoint)
     target = f"{host}:{port}"
-    selected_model = str(model or "").strip()
-    if not selected_model:
-        raise RuntimeError(
-            "Draw Things gRPCServerCLI 未选择模型。请连接服务后从实时模型列表中选择。"
-        )
     width, height = _parse_size(size)
     input_image = None
     image_strength = None
