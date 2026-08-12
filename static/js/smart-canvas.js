@@ -1241,6 +1241,13 @@ function restoreSmartSettingsAfterRun(runNode, previousSettings){
     const selected = selectedNode();
     const activeSubject = isSmartRunnableNode(selected) ? selected : activeSettingsSubject();
     if(activeSubject?.id === runNode?.id || !activeSubject){
+        if(activeSubject?.id === runNode?.id
+            && runNode?.runSettings?.engine === 'comfy'
+            && runNode?.runSettings?.comfyMode === 'custom'
+            && runNode.runSettings.comfyParams
+            && typeof runNode.runSettings.comfyParams === 'object'){
+            previousSettings.comfyParams = cloneSmartSettings(runNode.runSettings.comfyParams);
+        }
         settings = previousSettings;
         return;
     }
@@ -15939,6 +15946,37 @@ function comfyParamsFromWorkflowValues(config, values={}){
     });
     return params;
 }
+function applySmartComfySeedResult(runSettings, fields=[], result={}){
+    if(!runSettings || !Array.isArray(fields) || !result) return false;
+    const seedValues = result.seed_values && typeof result.seed_values === 'object' ? result.seed_values : {};
+    const fallbackSeed = Number(result.seed);
+    const seedFields = fields.filter(generationSeedField);
+    let changed = false;
+    runSettings.comfyParams = runSettings.comfyParams || {};
+    seedFields.forEach(field => {
+        if(comfyRandomEnabledField(field) && !smartComfyRandomActiveFor(runSettings, field.id)) return;
+        const keys = [
+            `${field.node}:${field.input}`,
+            `${field.node}.${field.input}`,
+            String(field.input || ''),
+        ];
+        let value;
+        for(const key of keys){
+            if(seedValues[key] !== undefined){
+                value = seedValues[key];
+                break;
+            }
+        }
+        if(value === undefined && seedFields.length === 1 && Number.isFinite(fallbackSeed)) value = fallbackSeed;
+        const numericValue = Number(value);
+        if(!Number.isFinite(numericValue)) return;
+        if(Number(runSettings.comfyParams[field.id]) !== numericValue){
+            runSettings.comfyParams[field.id] = numericValue;
+            changed = true;
+        }
+    });
+    return changed;
+}
 function buildPromptRequestForNode(node, defaultImages, ctx=smartLoopContext){
     const oldHtml = promptInput.innerHTML;
     loadNodePromptDraftToInput(node);
@@ -16068,10 +16106,17 @@ async function generateComfyUrlsWithSettings(runSettings, prompt, refs){
         if(cached.length) return {urls:cached.slice(), kind:'image', cached:true, cacheKey};
     }
     const result = await runQueuedSmartComfyGenerate({prompt, workflow_json:workflowName, params, type:'workflow-custom', client_id:smartClientId});
+    applySmartComfySeedResult(runSettings, fields, result);
     const urls = resultMediaUrls(result);
     const fallbackKind = result.videos?.length ? 'video' : result.audios?.length ? 'audio' : result.texts?.length ? 'text' : 'image';
     rememberFixedSeedGenerationResult(cacheKey, urls);
-    return {urls, kind:mediaKindForUrls(urls, fallbackKind), cacheKey};
+    return {
+        urls,
+        kind:mediaKindForUrls(urls, fallbackKind),
+        cacheKey,
+        seed:result.seed,
+        seed_values:result.seed_values
+    };
 }
 async function runCascadeStepIntoNode(sourceNode, targetNode, inputRefs, ctx=smartLoopContext){
     const outputNode = targetNode || sourceNode;
@@ -16142,7 +16187,24 @@ async function runCascadeStepIntoNode(sourceNode, targetNode, inputRefs, ctx=sma
     settings = previousSettings;
     try {
         const result = await generateUrlsForCurrentSettings(requestNode, prompt, request.refs || [], runSettings);
+        if(runSettings.engine === 'comfy' && runSettings.comfyMode === 'custom'){
+            const workflowName = runSettings.comfyWorkflow || comfyWorkflows[0]?.name || '';
+            const wf = workflowName ? await ensureComfyWorkflow(workflowName) : null;
+            applySmartComfySeedResult(meta.settings, wf?.config?.fields || [], {
+                seed:result.seed,
+                seed_values:result.seed_values
+            });
+        }
         const appliedSeed = applyDrawThingsSeedResult(result, runSettings, previousSettings, meta, outputNode);
+        if(runSettings.engine === 'comfy' && runSettings.comfyMode === 'custom'){
+            const workflowName = runSettings.comfyWorkflow || comfyWorkflows[0]?.name || '';
+            const wf = workflowName ? await ensureComfyWorkflow(workflowName) : null;
+            const fields = wf?.config?.fields || [];
+            applySmartComfySeedResult(targetPromptState.runSettings, fields, {
+                seed:result.seed,
+                seed_values:result.seed_values
+            });
+        }
         // 级联节点完成后会恢复这份旧快照；保留本次真实提交的 seed，避免它覆盖新值。
         if(appliedSeed && targetPromptState.runSettings && isDrawThingsProvider(targetPromptState.runSettings.provider_id || runSettings.provider_id)){
             targetPromptState.runSettings.drawThingsSeed = appliedSeed;
@@ -17285,7 +17347,7 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta, runSett
         fields:fields.filter(f => comfyFieldKind(f) === 'setting'),
         valueFor:field => values[field.id],
         randomEnabled:comfyRandomEnabledField,
-        randomActive:field => smartComfyRandomActive(field.id)
+        randomActive:field => smartComfyRandomActiveFor(runSettings, field.id)
     });
     const cacheKey = generationRequestFingerprint({engine:'comfy', mode, workflow:workflowName, prompt, refs:allRefs, params}, 1, fixedSeedState);
     const cached = cacheKey ? fixedSeedGenerationCache.get(cacheKey) || [] : [];
@@ -17297,6 +17359,8 @@ async function runComfyGeneration(node, prompt, refs, pendingNode, meta, runSett
         return;
     }
     const result = await runQueuedSmartComfyGenerate({prompt, workflow_json:workflowName, params, type:'workflow-custom', client_id:smartClientId});
+    applySmartComfySeedResult(runSettings, fields, result);
+    applySmartComfySeedResult(meta?.settings, fields, result);
     const urls = resultMediaUrls(result);
     if(!urls.length) throw new Error(tr('smart.errComfyNoImages'));
     const kind = mediaKindForUrls(urls, result.videos?.length ? 'video' : result.audios?.length ? 'audio' : result.texts?.length ? 'text' : 'image');

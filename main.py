@@ -18976,6 +18976,25 @@ def generate(req: GenerateRequest):
                     "_meta": node_inputs.get("_meta") if isinstance(node_inputs.get("_meta"), dict) else {"title": str(node_inputs.get("class_type"))},
                 }
 
+        # Custom workflows can put their seed on any node, so the generic
+        # random value above is not necessarily the value sent to ComfyUI.
+        # Collect the numeric seed inputs after applying all frontend params.
+        seed_values = {}
+        for node_id, node_data in workflow.items():
+            inputs = node_data.get("inputs") if isinstance(node_data, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            for input_name, value in inputs.items():
+                normalized_name = str(input_name or "").strip().lower().replace("-", "_").replace(" ", "_")
+                if normalized_name not in {"seed", "noise_seed", "random_seed"}:
+                    continue
+                try:
+                    seed_values[f"{node_id}:{input_name}"] = int(float(value))
+                except (TypeError, ValueError):
+                    continue
+        if seed_values:
+            seed = next(iter(seed_values.values()))
+
         p = {"prompt": workflow, "client_id": CLIENT_ID}
         data = json.dumps(p).encode('utf-8')
         try:
@@ -19096,6 +19115,7 @@ def generate(req: GenerateRequest):
             "items": local_items,
             "outputs": local_urls,
             "seed": seed,
+            "seed_values": seed_values,
             "timestamp": current_timestamp,
             "type": req.type,
             "workflow_json": req.workflow_json,

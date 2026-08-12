@@ -12974,6 +12974,7 @@ async function runComfyNode(nodeId, opts={}){
             if(result.error) throw new Error(actionFailed('canvas.comfyCustom', result.error));
             images = comfyResultOutputs(result);
             if(!images.length) throw new Error(noReturnedImage('canvas.comfyCustom'));
+            applyComfySeedResult(node, settingFields, result);
             rememberGenerationOutputs(node, fixedSeedCacheKey, images);
         } else {
             run.taskLabel = tr('canvas.comfyEdit');
@@ -13640,6 +13641,38 @@ function requestMetaFromResult(result={}){
         workflow_json: result.workflow_json || '',
         seed: result.seed || '',
     };
+}
+function applyComfySeedResult(node, fields=[], result={}){
+    if(!node || !Array.isArray(fields) || !result) return false;
+    const seedValues = result.seed_values && typeof result.seed_values === 'object' ? result.seed_values : {};
+    const fallbackSeed = Number(result.seed);
+    const seedFields = fields.filter(generationSeedField);
+    let changed = false;
+    fields.filter(generationSeedField).forEach(field => {
+        const keys = [
+            `${field.node}:${field.input}`,
+            `${field.node}.${field.input}`,
+            String(field.input || ''),
+        ];
+        let value;
+        for(const key of keys){
+            if(seedValues[key] !== undefined){
+                value = seedValues[key];
+                break;
+            }
+        }
+        if(value === undefined && seedFields.length === 1 && Number.isFinite(fallbackSeed)) value = fallbackSeed;
+        if(value === undefined) return;
+        const numericValue = Number(value);
+        if(!Number.isFinite(numericValue)) return;
+        node.comfyParams = node.comfyParams || {};
+        if(Number(node.comfyParams[field.id]) !== numericValue){
+            node.comfyParams[field.id] = numericValue;
+            changed = true;
+        }
+    });
+    if(changed) refreshNodes([node.id]);
+    return changed;
 }
 function runPlatformLabel(run){
     const node = run?.node || {};
