@@ -11739,13 +11739,16 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             local_image_paths = [openai_video_proxy_local_image_path(ref) for ref in refs_for_proxy]
             has_local_images = any(local_image_paths)
             if has_local_images:
-                form_data = [(key, value) for key, value in body.items()]
+                form_data = dict(body)
+                remote_image_urls = []
                 for ref, local_path in zip(refs_for_proxy, local_image_paths):
                     if local_path:
                         continue
                     url = await openai_video_proxy_public_reference_url(ref)
                     if url:
-                        form_data.append(("images", url))
+                        remote_image_urls.append(url)
+                if remote_image_urls:
+                    form_data["images"] = remote_image_urls
                 files = []
                 opened = []
                 try:
