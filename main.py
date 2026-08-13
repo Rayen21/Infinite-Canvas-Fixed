@@ -3346,6 +3346,12 @@ def reserve_best_backend(required_images: List[str] = None):
         except Exception as e:
             print(f"Backend {addr} unreachable: {e}")
             continue
+    if not backend_stats:
+        configured = ", ".join(COMFYUI_INSTANCES) or "未配置"
+        raise HTTPException(
+            status_code=502,
+            detail=f"没有可用的 ComfyUI 后端：{configured}。请检查服务是否启动，以及端口是否可访问",
+        )
     with LOAD_LOCK:
         best_backend = COMFYUI_INSTANCES[0]
         min_load = float('inf')
@@ -3357,6 +3363,36 @@ def reserve_best_backend(required_images: List[str] = None):
                     best_backend = addr
         BACKEND_LOCAL_LOAD[best_backend] = BACKEND_LOCAL_LOAD.get(best_backend, 0) + 1
         return best_backend
+
+def get_comfy_backend_upload_order():
+    """Return reachable ComfyUI backends first, ordered by current load.
+
+    Uploading to every configured backend is both slow and fragile: one stale
+    or disconnected address can make an otherwise healthy backend look like a
+    total upload failure.  A generated workflow can still synchronize its
+    input files to the backend selected later by ``reserve_best_backend``.
+    """
+    backend_stats = {}
+    for addr in COMFYUI_INSTANCES:
+        try:
+            response = requests.get(
+                f"http://{addr}/queue",
+                headers={"Connection": "close", "Cache-Control": "no-cache"},
+                timeout=COMFYUI_BACKEND_CHECK_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            remote_load = len(data.get("queue_running", [])) + len(data.get("queue_pending", []))
+            with LOAD_LOCK:
+                local_load = BACKEND_LOCAL_LOAD.get(addr, 0)
+            backend_stats[addr] = max(remote_load, local_load)
+        except Exception as exc:
+            print(f"ComfyUI upload backend unavailable {addr}: {exc}")
+
+    return sorted(
+        backend_stats,
+        key=lambda addr: (backend_stats[addr], COMFYUI_INSTANCES.index(addr)),
+    )
 
 # --- 辅助工具 ---
 
@@ -12339,15 +12375,20 @@ async def export_minimax_timeline(payload: MiniMaxTimelineExportRequest):
 async def upload_image(files: List[UploadFile] = File(...)):
     uploaded_files = []
     files_content = []
+    backend_order = get_comfy_backend_upload_order()
+    if not backend_order:
+        raise HTTPException(
+            status_code=502,
+            detail="没有可用的 ComfyUI 后端：请检查已配置地址的服务是否启动，以及端口是否可访问",
+        )
     for file in files:
         content = await file.read()
         files_content.append((file, content))
 
     for file, content in files_content:
-        success_count = 0
         last_result = None
         upload_errors = []
-        for addr in COMFYUI_INSTANCES:
+        for addr in backend_order:
             try:
                 files_data = {'image': (file.filename, content, file.content_type)}
                 response = requests.post(
@@ -12357,14 +12398,14 @@ async def upload_image(files: List[UploadFile] = File(...)):
                 )
                 if response.status_code == 200:
                     last_result = response.json()
-                    success_count += 1
+                    break
                 else:
                     upload_errors.append(f"{addr}: HTTP {response.status_code}")
             except Exception as e:
                 print(f"Upload error for {addr}: {e}")
                 upload_errors.append(f"{addr}: {e}")
 
-        if success_count > 0 and last_result:
+        if last_result:
             uploaded_files.append({"comfy_name": last_result.get("name", file.filename)})
         else:
             detail = "Failed to upload to any backend"
@@ -12450,7 +12491,7 @@ async def upload_ai_base64(payload: Base64UploadRequest):
 
 @app.post("/api/comfyui/upload-base64")
 async def upload_comfyui_base64(payload: Base64UploadRequest):
-    """base64 方式把图片传到 ComfyUI 各后端的 input 目录，返回 comfy 用文件名（供 UXP 做 ComfyUI 图生图）。"""
+    """Upload a base64 image to one reachable ComfyUI backend."""
     raw = (payload.data or "").strip()
     ct = (payload.content_type or "").split(";", 1)[0].strip().lower()
     if raw.startswith("data:"):
@@ -12466,16 +12507,30 @@ async def upload_comfyui_base64(payload: Base64UploadRequest):
     _, ext = _local_upload_kind_ext(payload.name or "", ct or "image/png")
     filename = f"dx_{uuid.uuid4().hex[:12]}{ext or '.png'}"
     comfy_name = None
-    for addr in COMFYUI_INSTANCES:
+    upload_errors = []
+    backend_order = get_comfy_backend_upload_order()
+    if not backend_order:
+        raise HTTPException(
+            status_code=502,
+            detail="没有可用的 ComfyUI 后端：请检查已配置地址的服务是否启动，以及端口是否可访问",
+        )
+    for addr in backend_order:
         try:
             resp = requests.post(f"http://{addr}/upload/image",
-                                 files={'image': (filename, content, ct or 'image/png')}, timeout=10)
+                                 files={'image': (filename, content, ct or 'image/png')},
+                                 timeout=(COMFYUI_BACKEND_CHECK_TIMEOUT, COMFYUI_UPLOAD_TIMEOUT))
             if resp.status_code == 200:
                 comfy_name = resp.json().get("name", filename)
+                break
+            upload_errors.append(f"{addr}: HTTP {resp.status_code}")
         except Exception as exc:
             print(f"ComfyUI base64 upload error for {addr}: {exc}")
+            upload_errors.append(f"{addr}: {exc}")
     if not comfy_name:
-        raise HTTPException(status_code=502, detail="上传到 ComfyUI 失败")
+        detail = "上传到 ComfyUI 失败"
+        if upload_errors:
+            detail += f": {'; '.join(upload_errors[:3])}"
+        raise HTTPException(status_code=502, detail=detail)
     return {"name": comfy_name}
 
 def _local_upload_kind_ext(filename, content_type):
