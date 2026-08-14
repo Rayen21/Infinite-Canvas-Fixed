@@ -603,6 +603,9 @@ COMFYUI_DOWNLOAD_TIMEOUT = float(os.getenv("COMFYUI_DOWNLOAD_TIMEOUT", "300"))
 COMFYUI_DOWNLOAD_RETRIES = max(1, int(float(os.getenv("COMFYUI_DOWNLOAD_RETRIES", "3"))))
 COMFYUI_DOWNLOAD_RETRY_DELAY = max(0.0, float(os.getenv("COMFYUI_DOWNLOAD_RETRY_DELAY", "1")))
 COMFYUI_UPLOAD_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_TIMEOUT", "60"))
+COMFYUI_UPLOAD_CONNECT_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_CONNECT_TIMEOUT", "10"))
+COMFYUI_UPLOAD_READ_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_READ_TIMEOUT", str(COMFYUI_UPLOAD_TIMEOUT)))
+COMFYUI_BACKEND_FAILURE_COOLDOWN = max(0.0, float(os.getenv("COMFYUI_BACKEND_FAILURE_COOLDOWN", "30")))
 APIMART_IMAGE_TASK_TIMEOUT = float(os.getenv("APIMART_IMAGE_TASK_TIMEOUT", "1800"))
 APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"))
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
@@ -1558,6 +1561,7 @@ def update_env_values(updates):
         f.write("\n".join(next_lines).rstrip() + "\n")
 
 BACKEND_LOCAL_LOAD = {addr: 0 for addr in COMFYUI_INSTANCES}
+COMFYUI_BACKEND_COOLDOWN_UNTIL = {}
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
@@ -3258,6 +3262,24 @@ def collect_required_comfy_media(params: Dict[str, Any]) -> List[str]:
                 required.append(value)
     return list(dict.fromkeys(required))
 
+def mark_comfy_backend_failed(addr: str, reason: str = ""):
+    with LOAD_LOCK:
+        COMFYUI_BACKEND_COOLDOWN_UNTIL[addr] = time.monotonic() + COMFYUI_BACKEND_FAILURE_COOLDOWN
+    if reason:
+        print(f"ComfyUI backend temporarily disabled {addr}: {reason}")
+
+def clear_comfy_backend_failure(addr: str):
+    with LOAD_LOCK:
+        COMFYUI_BACKEND_COOLDOWN_UNTIL.pop(addr, None)
+
+def comfy_backend_is_available(addr: str) -> bool:
+    with LOAD_LOCK:
+        cooldown_until = COMFYUI_BACKEND_COOLDOWN_UNTIL.get(addr, 0.0)
+        if cooldown_until and cooldown_until <= time.monotonic():
+            COMFYUI_BACKEND_COOLDOWN_UNTIL.pop(addr, None)
+            return True
+        return not cooldown_until
+
 def comfy_prompt_error_message(status_code: int, error_body: str) -> str:
     """Turn ComfyUI's validation payload into a useful canvas error."""
     fallback = str(error_body or "").strip()
@@ -3302,6 +3324,8 @@ def get_best_backend(required_images: List[str] = None):
     backend_stats = {}
 
     for addr in COMFYUI_INSTANCES:
+        if not comfy_backend_is_available(addr):
+            continue
         try:
             request = urllib.request.Request(
                 f"http://{addr}/queue",
@@ -3333,6 +3357,8 @@ def get_best_backend(required_images: List[str] = None):
 def reserve_best_backend(required_images: List[str] = None):
     backend_stats = {}
     for addr in COMFYUI_INSTANCES:
+        if not comfy_backend_is_available(addr):
+            continue
         try:
             request = urllib.request.Request(
                 f"http://{addr}/queue",
@@ -3374,6 +3400,8 @@ def get_comfy_backend_upload_order():
     """
     backend_stats = {}
     for addr in COMFYUI_INSTANCES:
+        if not comfy_backend_is_available(addr):
+            continue
         try:
             response = requests.get(
                 f"http://{addr}/queue",
@@ -12394,16 +12422,20 @@ async def upload_image(files: List[UploadFile] = File(...)):
                 response = requests.post(
                     f"http://{addr}/upload/image",
                     files=files_data,
-                    timeout=(10, COMFYUI_UPLOAD_TIMEOUT),
+                    headers={"Connection": "close"},
+                    timeout=(COMFYUI_UPLOAD_CONNECT_TIMEOUT, COMFYUI_UPLOAD_READ_TIMEOUT),
                 )
                 if response.status_code == 200:
                     last_result = response.json()
+                    clear_comfy_backend_failure(addr)
                     break
                 else:
                     upload_errors.append(f"{addr}: HTTP {response.status_code}")
+                    mark_comfy_backend_failed(addr, f"upload HTTP {response.status_code}")
             except Exception as e:
                 print(f"Upload error for {addr}: {e}")
                 upload_errors.append(f"{addr}: {e}")
+                mark_comfy_backend_failed(addr, str(e))
 
         if last_result:
             uploaded_files.append({"comfy_name": last_result.get("name", file.filename)})
@@ -12518,14 +12550,18 @@ async def upload_comfyui_base64(payload: Base64UploadRequest):
         try:
             resp = requests.post(f"http://{addr}/upload/image",
                                  files={'image': (filename, content, ct or 'image/png')},
-                                 timeout=(COMFYUI_BACKEND_CHECK_TIMEOUT, COMFYUI_UPLOAD_TIMEOUT))
+                                 headers={"Connection": "close"},
+                                 timeout=(COMFYUI_UPLOAD_CONNECT_TIMEOUT, COMFYUI_UPLOAD_READ_TIMEOUT))
             if resp.status_code == 200:
                 comfy_name = resp.json().get("name", filename)
+                clear_comfy_backend_failure(addr)
                 break
             upload_errors.append(f"{addr}: HTTP {resp.status_code}")
+            mark_comfy_backend_failed(addr, f"upload HTTP {resp.status_code}")
         except Exception as exc:
             print(f"ComfyUI base64 upload error for {addr}: {exc}")
             upload_errors.append(f"{addr}: {exc}")
+            mark_comfy_backend_failed(addr, str(exc))
     if not comfy_name:
         detail = "上传到 ComfyUI 失败"
         if upload_errors:
