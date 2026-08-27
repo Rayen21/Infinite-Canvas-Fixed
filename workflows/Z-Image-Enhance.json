@@ -1,7 +1,7 @@
 {
   "15": {
     "inputs": {
-      "image": "pasted/image (794).png"
+      "image": "03bf24f5aea63cc83f77eb93b23ecdc4.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -11,14 +11,8 @@
   "23": {
     "inputs": {
       "text": "丰富的细节",
-      "speak_and_recognation": {
-        "__value__": [
-          false,
-          true
-        ]
-      },
       "clip": [
-        "34",
+        "206",
         0
       ]
     },
@@ -41,38 +35,11 @@
   },
   "27": {
     "inputs": {
-      "vae_name": "ae.safetensors"
+      "vae_name": "z_image_turbo_vae.safetensors"
     },
     "class_type": "VAELoader",
     "_meta": {
       "title": "VAE加载器"
-    }
-  },
-  "33": {
-    "inputs": {
-      "model_name": "z_image_turbo_bf16.safetensors",
-      "weight_dtype": "default",
-      "key_opt": "",
-      "mode": "Auto"
-    },
-    "class_type": "LoadDiffusionModelShared //Inspire",
-    "_meta": {
-      "title": "Shared Diffusion Model Loader (Inspire)"
-    }
-  },
-  "34": {
-    "inputs": {
-      "model_name1": "qwen_3_4b.safetensors",
-      "model_name2": "None",
-      "model_name3": "None",
-      "type": "stable_diffusion",
-      "key_opt": "",
-      "mode": "Auto",
-      "device": "default"
-    },
-    "class_type": "LoadTextEncoderShared //Inspire",
-    "_meta": {
-      "title": "Shared Text Encoder Loader (Inspire)"
     }
   },
   "142": {
@@ -93,7 +60,7 @@
   },
   "146": {
     "inputs": {
-      "seed": 279629946795727,
+      "seed": 702670365108595,
       "steps": 10,
       "cfg": 0.7,
       "sampler_name": "euler",
@@ -156,7 +123,7 @@
   },
   "165": {
     "inputs": {
-      "name": "Z-Image-Turbo-Fun-Controlnet-Union.safetensors"
+      "name": "Z-Image-Turbo-Fun-Controlnet-Union-2.1.safetensors"
     },
     "class_type": "ModelPatchLoader",
     "_meta": {
@@ -167,7 +134,7 @@
     "inputs": {
       "strength": 0.8,
       "model": [
-        "33",
+        "205",
         0
       ],
       "model_patch": [
@@ -219,7 +186,7 @@
   },
   "181": {
     "inputs": {
-      "seed": 820960346993579,
+      "seed": 82007311503644,
       "steps": 10,
       "cfg": 1,
       "sampler_name": "euler_cfg_pp",
@@ -229,7 +196,7 @@
         0
       ],
       "model": [
-        "33",
+        "205",
         0
       ],
       "positive": [
@@ -252,7 +219,7 @@
   },
   "184": {
     "inputs": {
-      "seed": 882274830236035,
+      "seed": 154276203336202,
       "strength": [
         "202",
         0
@@ -334,12 +301,6 @@
   "201": {
     "inputs": {
       "expression": "(a+b)*c/10000",
-      "speak_and_recognation": {
-        "__value__": [
-          false,
-          true
-        ]
-      },
       "a": [
         "193",
         0
@@ -378,6 +339,27 @@
     "class_type": "FloatConstant",
     "_meta": {
       "title": "浮点常量"
+    }
+  },
+  "205": {
+    "inputs": {
+      "unet_name": "z_image_turbo_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "206": {
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "stable_diffusion",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
     }
   }
 }

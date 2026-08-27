@@ -1,0 +1,82 @@
+{
+  "title": "flux-2-klein-4B-360-erp-outpaint",
+  "fields": [
+    {
+      "id": "f_hs12dis",
+      "node": "70",
+      "input": "output_preset",
+      "name": "output_preset",
+      "type": "dropdown",
+      "default": "2048",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [
+        "\"1024\"",
+        "\"2048\"",
+        "\"4096\""
+      ],
+      "random_enabled": false
+    },
+    {
+      "id": "f_gphzh40",
+      "node": "70",
+      "input": "coverage",
+      "name": "coverage",
+      "type": "dropdown",
+      "default": "360",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [
+        "\"360\"",
+        "\"180\""
+      ],
+      "random_enabled": false
+    },
+    {
+      "id": "f_u7zqx2x",
+      "node": "6",
+      "input": "text",
+      "name": "提示词文本",
+      "type": "textarea",
+      "default": "Fill the green spaces according to the image. Outpaint as a seamless 360 equirectangular panorama (2:1). Keep the horizon level. Match left and right edges.这个是一个工业风格的办公室空间。",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    },
+    {
+      "id": "f_2xl7wtn",
+      "node": "70",
+      "input": "Open Stickers Editor",
+      "name": "Open Stickers Editor",
+      "type": "image",
+      "default": null,
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    }
+  ],
+  "mini_cards": {
+    "prompt": {
+      "x": 24,
+      "y": 30
+    },
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    }
+  }
+}

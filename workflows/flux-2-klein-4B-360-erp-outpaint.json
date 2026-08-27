@@ -1,0 +1,255 @@
+{
+  "6": {
+    "inputs": {
+      "text": "Fill the green spaces according to the image. Outpaint as a seamless 360 equirectangular panorama (2:1). Keep the horizon level. Match left and right edges.这个是一个工业风格的办公室空间。",
+      "clip": [
+        "44",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "31",
+        0
+      ],
+      "vae": [
+        "43",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "31": {
+    "inputs": {
+      "seed": 12345,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "63",
+        0
+      ],
+      "positive": [
+        "49",
+        0
+      ],
+      "negative": [
+        "55",
+        0
+      ],
+      "latent_image": [
+        "52",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "K采样器"
+    }
+  },
+  "33": {
+    "inputs": {
+      "text": "text, worst quality, blurry, ugly",
+      "clip": [
+        "44",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Negative Prompt)"
+    }
+  },
+  "43": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "44": {
+    "inputs": {
+      "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "48": {
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-int8-ConvRot-comfyui.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "49": {
+    "inputs": {
+      "conditioning": [
+        "6",
+        0
+      ],
+      "latent": [
+        "52",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "参考Latent"
+    }
+  },
+  "52": {
+    "inputs": {
+      "pixels": [
+        "70",
+        0
+      ],
+      "vae": [
+        "43",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "55": {
+    "inputs": {
+      "conditioning": [
+        "33",
+        0
+      ],
+      "latent": [
+        "52",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "参考Latent"
+    }
+  },
+  "58": {
+    "inputs": {
+      "coverage": "360",
+      "fps": 24,
+      "Open Preview": null,
+      "erp_image": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "PanoramaPreview",
+    "_meta": {
+      "title": "Panorama Preview"
+    }
+  },
+  "60": {
+    "inputs": {
+      "images": [
+        "70",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "预览图像"
+    }
+  },
+  "63": {
+    "inputs": {
+      "lora_name": "flux-2-klein-9B-360-erp-outpaint-lora_V1.safetensors",
+      "strength_model": 0.9,
+      "model": [
+        "48",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器（仅模型）"
+    }
+  },
+  "66": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "71",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "70": {
+    "inputs": {
+      "output_preset": "2048",
+      "coverage": "360",
+      "bg_color": "#00ff00",
+      "state_json": "{\"version\": 1, \"projection_model\": \"pinhole_rectilinear\", \"alpha_mode\": \"straight\", \"coverage\": \"360\", \"bg_color\": \"#00ff00\", \"output_preset\": \"2048\", \"assets\": {\"asset_43e97d1b\": {\"type\": \"comfy_image\", \"filename\": \"image (29).png\", \"subfolder\": \"panorama_stickers\", \"storage\": \"input\", \"name\": \"image (29).png\"}}, \"stickers\": [{\"id\": \"st_4916c061\", \"asset_id\": \"asset_43e97d1b\", \"yaw_deg\": -3.7037037037035816, \"pitch_deg\": -3.086418809960307, \"hFOV_deg\": 46.91685694694386, \"vFOV_deg\": 79.92354207262883, \"rot_deg\": 0, \"z_index\": 0, \"aspect_id\": \"259:500\"}], \"shots\": [], \"painting\": {\"version\": 1, \"groups\": [], \"paint\": {\"strokes\": []}, \"mask\": {\"strokes\": []}, \"raster_objects\": []}, \"painting_layer\": null, \"ui_settings\": {\"invert_view_x\": false, \"invert_view_y\": false, \"preview_quality\": \"balanced\"}, \"active\": {\"selected_sticker_id\": \"st_4916c061\", \"selected_shot_id\": null}}",
+      "fps": 24,
+      "Open Stickers Editor": null
+    },
+    "class_type": "PanoramaStickers",
+    "_meta": {
+      "title": "Panorama Stickers"
+    }
+  },
+  "71": {
+    "inputs": {
+      "coverage": "360",
+      "state_json": "{\"version\": 1, \"projection_model\": \"pinhole_rectilinear\", \"alpha_mode\": \"straight\", \"coverage\": \"360\", \"bg_color\": \"#00ff00\", \"output_preset\": \"2048\", \"assets\": {}, \"stickers\": [], \"shots\": [], \"painting\": {\"version\": 1, \"groups\": [], \"paint\": {\"strokes\": []}, \"mask\": {\"strokes\": []}, \"raster_objects\": []}, \"painting_layer\": null, \"ui_settings\": {\"invert_view_x\": false, \"invert_view_y\": false, \"preview_quality\": \"balanced\"}, \"active\": {\"selected_sticker_id\": null, \"selected_shot_id\": null}}",
+      "output_megapixels": 1,
+      "fps": 24,
+      "Open Cutout Editor": null,
+      "erp_image": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "PanoramaCutout",
+    "_meta": {
+      "title": "Panorama Cutout"
+    }
+  },
+  "72": {
+    "inputs": {
+      "image": "image (29).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "73": {
+    "inputs": {
+      "image": "flower_road_4k.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  }
+}
