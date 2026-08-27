@@ -363,9 +363,7 @@ try:
     GEMINI_CLI_DEFAULT_TIMEOUT = max(30, min(3600, int(os.getenv("GEMINI_CLI_TIMEOUT", "900"))))
 except Exception:
     GEMINI_CLI_DEFAULT_TIMEOUT = 900
-AGNES_DEFAULT_CHAT_MODELS = ["agnes-2.5-flash"]
-AGNES_DEFAULT_VIDEO_MODELS = ["agnes-video-v2.0", "agnes-video-2.5-flash"]
-AGNES_API_HOSTS = ("apihub.agnes-ai.com", "apihub.agnes-ai.cn")
+AGNES_DEFAULT_VIDEO_MODELS = ["agnes-video-v2.0"]
 JIMENG_LEGACY_IMAGE_MODELS = {
     "jimeng-image-2k",
     "jimeng-image-4k",
@@ -853,16 +851,6 @@ def default_api_providers():
 
 def merge_default_api_providers(providers, inject_missing=True):
     merged = [dict(item) for item in providers]
-    for provider in merged:
-        if is_agnes_provider(provider):
-            provider["chat_models"] = model_list_from_values([
-                *(provider.get("chat_models") or []),
-                *AGNES_DEFAULT_CHAT_MODELS,
-            ])
-            provider["video_models"] = model_list_from_values([
-                *(provider.get("video_models") or []),
-                *AGNES_DEFAULT_VIDEO_MODELS,
-            ])
     # 强制保留独立入口平台（不再强制 comfly）
     ms_default = next((d for d in default_api_providers() if d["id"] == "modelscope"), None)
     if ms_default:
@@ -5031,7 +5019,7 @@ def is_apimart_provider(provider):
 
 def detect_image_request_mode(base_url="", models=None):
     base = str(base_url or "").strip().lower()
-    if any(host in base for host in AGNES_API_HOSTS):
+    if "apihub.agnes-ai.com" in base:
         return "openai-json"
     for model in models or []:
         if str(model or "").strip().lower().startswith("agnes-image-"):
@@ -6108,14 +6096,7 @@ def is_lingjing_provider(provider):
 def is_agnes_provider(provider, model=""):
     base_url = str((provider or {}).get("base_url") or "").lower()
     model_id = str(model or "").strip().lower()
-    return (
-        any(host in base_url for host in AGNES_API_HOSTS)
-        or model_id.startswith("agnes-video-")
-        or model_id in AGNES_DEFAULT_CHAT_MODELS
-    )
-
-def is_agnes_video_25_flash_model(model):
-    return str(model or "").strip().lower() == "agnes-video-2.5-flash"
+    return "apihub.agnes-ai.com" in base_url or model_id.startswith("agnes-video-")
 
 # ---- 数字人/真人认证：平台无关分发 ----
 # 认证是一个跨平台功能。每个平台用不同的资产 API 实现，但对外是统一入口。
@@ -14311,23 +14292,16 @@ def parse_upstream_models(raw, protocol="openai"):
     return grouped, ids
 
 def apply_agnes_model_defaults(base_url, grouped, ids):
-    base = str(base_url or "").strip().lower()
-    if not any(host in base for host in AGNES_API_HOSTS):
+    if "apihub.agnes-ai.com" not in str(base_url or "").strip().lower():
         return grouped, ids
     grouped = {key: list(value or []) for key, value in (grouped or {}).items()}
     ids = list(ids or [])
-    for model in AGNES_DEFAULT_CHAT_MODELS:
-        if model not in ids:
-            ids.append(model)
-        if model not in grouped.setdefault("chat", []):
-            grouped["chat"].append(model)
     for model in AGNES_DEFAULT_VIDEO_MODELS:
         if model not in ids:
             ids.append(model)
         if model not in grouped.setdefault("video", []):
             grouped["video"].append(model)
     ids = sorted(set(ids))
-    grouped["chat"] = sorted(set(grouped.get("chat") or []))
     grouped["video"] = sorted(set(grouped.get("video") or []))
     return grouped, ids
 
@@ -15848,6 +15822,16 @@ async def wait_for_agnes_video_task(client, provider, video_id, model):
 
 async def generate_agnes_video(client, payload, provider, base_url, requested_model):
     model = selected_model(requested_model, "agnes-video-v2.0")
+    width, height = agnes_video_dimensions(payload.aspect_ratio, payload.resolution)
+    num_frames, frame_rate = agnes_video_frame_count(payload.duration, 24)
+    body = {
+        "model": model,
+        "prompt": str(payload.prompt or ""),
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "frame_rate": frame_rate,
+    }
     image_urls = []
     image_roles = []
     for ref in (payload.images or [])[:4]:
@@ -15855,80 +15839,15 @@ async def generate_agnes_video(client, payload, provider, base_url, requested_mo
         if url:
             image_urls.append(url)
             image_roles.append(str(getattr(ref, "role", "") or "").strip().lower())
-    if is_agnes_video_25_flash_model(model):
-        if payload.videos:
-            raise HTTPException(status_code=400, detail="Agnes Video 2.5 Flash 不支持视频参考输入，请移除视频后重试。")
-        try:
-            seconds = max(4, min(12, int(payload.duration or 5)))
-        except (TypeError, ValueError):
-            seconds = 5
-        aspect_ratio = str(payload.aspect_ratio or "16:9").strip()
-        if aspect_ratio not in {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}:
-            aspect_ratio = "16:9"
+    if len(image_urls) == 1:
+        body["image"] = image_urls[0]
+    elif len(image_urls) > 1:
+        body["extra_body"] = {"image": image_urls}
         has_frame_roles = any(role in {"first_frame", "last_frame"} for role in image_roles)
-        if has_frame_roles:
-            body = {
-                "model": model,
-                "prompt": str(payload.prompt or ""),
-                "mode": "keyframe",
-                "size": "720P",
-                "aspect_ratio": aspect_ratio,
-                "seconds": str(seconds),
-            }
-            for url, role in zip(image_urls, image_roles):
-                if role == "last_frame" and "last_frame" not in body:
-                    body["last_frame"] = url
-                elif "first_frame" not in body:
-                    body["first_frame"] = url
-                elif "last_frame" not in body:
-                    body["last_frame"] = url
-            if "first_frame" not in body and "last_frame" not in body:
-                raise HTTPException(status_code=400, detail="Agnes 关键帧模式至少需要一张参考图。")
-        elif image_urls or payload.audios:
-            body = {
-                "model": model,
-                "prompt": str(payload.prompt or ""),
-                "mode": "reference",
-                "size": "720P",
-                "aspect_ratio": aspect_ratio,
-                "seconds": str(seconds),
-            }
-            if image_urls:
-                body["images"] = image_urls[:5]
-            if payload.audios:
-                body["audios"] = list(payload.audios)
-        else:
-            body = {
-                "model": model,
-                "prompt": str(payload.prompt or ""),
-                "mode": "text",
-                "size": "720P",
-                "aspect_ratio": aspect_ratio,
-                "seconds": str(seconds),
-            }
-        if payload.seed is not None:
-            body["seed"] = payload.seed
-        body["n"] = 1
-    else:
-        width, height = agnes_video_dimensions(payload.aspect_ratio, payload.resolution)
-        num_frames, frame_rate = agnes_video_frame_count(payload.duration, 24)
-        body = {
-            "model": model,
-            "prompt": str(payload.prompt or ""),
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-            "frame_rate": frame_rate,
-        }
-        if len(image_urls) == 1:
-            body["image"] = image_urls[0]
-        elif len(image_urls) > 1:
-            body["extra_body"] = {"image": image_urls}
-            has_frame_roles = any(role in {"first_frame", "last_frame"} for role in image_roles)
-            if payload.multimodal or has_frame_roles:
-                body["extra_body"]["mode"] = "keyframes"
-        if payload.seed is not None:
-            body["seed"] = payload.seed
+        if payload.multimodal or has_frame_roles:
+            body["extra_body"]["mode"] = "keyframes"
+    if payload.seed is not None:
+        body["seed"] = payload.seed
     submit_url = f"{base_url}/v1/videos"
     response = await client.post(submit_url, headers=api_headers(provider=provider, model=model), json=body)
     response.raise_for_status()
@@ -16617,6 +16536,8 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["prompt"] = apply_trusted_asset_prompt_index(
                             body["prompt"], img_count, len(video_payload), len(audio_payload)
                         )
+                    if payload.seed is not None:
+                        body["seed"] = payload.seed
                     if payload.return_last_frame:
                         body["return_last_frame"] = True
                     if payload.generate_audio:
@@ -16713,6 +16634,8 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["content"][0]["text"] = apply_trusted_asset_prompt_index(
                             body["content"][0].get("text") or "", len(image_like_urls), volc_video_count, 0
                         )
+                    if payload.seed is not None:
+                        body["seed"] = payload.seed
                 elif is_yuli:
                     # 玉玉API（yuli.host）视频走自有 veo 统一格式：POST /v1/video/create。
                     # 字段：model / prompt / images[]（http(s) URL）/ enhance_prompt /
@@ -16772,6 +16695,8 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["enhance_prompt"] = True
                     if payload.enable_upsample:
                         body["enable_upsample"] = True
+                    if payload.seed is not None:
+                        body["seed"] = payload.seed
                     if payload.camerafixed:
                         body["camerafixed"] = True
                     if payload.return_last_frame:

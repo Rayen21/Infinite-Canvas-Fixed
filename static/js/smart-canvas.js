@@ -329,8 +329,6 @@ let settings = {
     videoProvider:'',
     videoModel:'',
     videoDuration:5,
-    videoSeed:0,
-    videoSeedRandom:true,
     videoAspect:'16:9',
     videoResolution:'',
     videoEnhancePrompt:false,
@@ -2919,7 +2917,7 @@ function modelscopeProvider(){
 function modelscopeImageModels(){
     return modelscopeProvider()?.image_models || ['Tongyi-MAI/Z-Image-Turbo'];
 }
-const DEFAULT_VIDEO_MODELS = ['veo3-fast','veo3','sora','runway','kling','pika','minimax-video','wan-v2','seedance-1.0-pro','jimeng-vide-3.0','jimeng-video-3.0-pro','agnes-video-v2.0','agnes-video-2.5-flash'];
+const DEFAULT_VIDEO_MODELS = ['veo3-fast','veo3','sora','runway','kling','pika','minimax-video','wan-v2','seedance-1.0-pro','jimeng-vide-3.0','jimeng-video-3.0-pro'];
 function videoApiProviders(){
     const fromConfig = (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'volcengine' && (p.video_models || []).length);
     if(fromConfig.length) return fromConfig;
@@ -2934,12 +2932,6 @@ function providerVideoModels(providerId){
     const provider = videoApiProviders().find(p => p.id === providerId);
     const models = provider?.video_models || DEFAULT_VIDEO_MODELS;
     return [...new Set(models)];
-}
-function videoSeedSupported(providerId, model){
-    const provider = videoProviderById(providerId) || {};
-    const values = [providerId, provider.id, provider.name, provider.protocol, provider.base_url, model]
-        .map(value => String(value || '').trim().toLowerCase());
-    return values.some(value => value.includes('agnes')) || values.some(value => value.startsWith('agnes-video-'));
 }
 function volcengineVideoModels(){
     const provider = (apiProviders || []).find(p => p.id === 'volcengine');
@@ -2982,30 +2974,6 @@ function renderVideoDurationControl(){
                 <span>${escapeHtml(tr('smart.custom'))}</span>
                 <input type="number" min="1" max="60" step="1" data-param="videoDuration" value="${v}">
             </label>
-        </div>
-    </div>`;
-}
-function videoRandomSeed(){ return Math.floor(Math.random() * 4294967295) + 1; }
-function normalizeVideoSeed(value){
-    const seed = Math.floor(Number(value));
-    if(!Number.isFinite(seed) || seed < 1) return videoRandomSeed();
-    return Math.min(4294967295, seed);
-}
-function resolveVideoSeed(runSettings=settings){
-    const random = runSettings.videoSeedRandom !== false;
-    const seed = random ? videoRandomSeed() : normalizeVideoSeed(runSettings.videoSeed);
-    runSettings.videoSeed = seed;
-    return seed;
-}
-function renderVideoSeedControl(){
-    const seed = normalizeVideoSeed(settings.videoSeed);
-    settings.videoSeed = seed;
-    const active = settings.videoSeedRandom !== false;
-    return `<div class="smart-control video-seed-control">
-        <div class="num-with-dice" title="${escapeHtml(tr('smart.drawThingsSeed'))}">
-            <span class="num-label">${escapeHtml(tr('smart.drawThingsSeed'))}</span>
-            <input type="number" min="1" max="4294967295" step="1" data-video-seed value="${escapeHtml(seed)}">
-            <button type="button" class="dice-btn ${active ? 'active' : ''}" data-video-seed-random title="${escapeHtml(active ? tr('smart.diceOn') : tr('smart.diceOff'))}" aria-label="${escapeHtml(active ? tr('smart.diceOn') : tr('smart.diceOff'))}"><i data-lucide="dice-5"></i></button>
         </div>
     </div>`;
 }
@@ -3270,7 +3238,6 @@ function renderApiVideoParams(){
         ${renderVideoResolutionControl()}
         ${renderVideoAspectControl()}
         ${renderVideoDurationControl()}
-        ${videoSeedSupported(settings.videoProvider, settings.videoModel) ? renderVideoSeedControl() : ''}
         ${renderVideoToggleControl('videoEnhancePrompt', tr('smart.videoEnhancePrompt'))}
         ${renderVideoToggleControl('videoEnableUpsample', tr('smart.videoUpsample'))}
         ${renderVideoToggleControl('videoGenerateAudio', tr('smart.videoGenerateAudio'))}
@@ -4466,7 +4433,7 @@ function smartComfyRandomValue(field){
     return Math.floor(value);
 }
 function setDynamicSetting(key, value){
-    const numericKeys = new Set(['count','width','height','videoDuration','videoSeed','enhanceStrength','enhanceUpscaleRes','editUpscaleRes','customRatioWidth','customRatioHeight','customWidth','customHeight','msCustomRatioWidth','msCustomRatioHeight','msCustomWidth','msCustomHeight']);
+    const numericKeys = new Set(['count','width','height','videoDuration','enhanceStrength','enhanceUpscaleRes','editUpscaleRes','customRatioWidth','customRatioHeight','customWidth','customHeight','msCustomRatioWidth','msCustomRatioHeight','msCustomWidth','msCustomHeight']);
     const layoutKeys = new Set(['provider_id','model','resolution','ratio','msgenModel','msCustomModel','msResolution','msRatio','videoProvider','videoModel','videoAspect','videoResolution','comfyMode','comfyWorkflow','quality','count','enhanceUpscaleRes','editUpscaleRes','jimengUpscaleRes','rhConfigKey','rhPayment','rhInstanceType']);
     settings[key] = numericKeys.has(key) && value !== '' ? Number(value) : value;
     if(key === 'provider_id') settings.model = '';
@@ -4617,33 +4584,6 @@ function bindDynamicParams(){
                 settings.drawThingsSeedRandom = false;
             } else {
                 settings.drawThingsSeedRandom = true;
-            }
-            persistActiveSmartSettings();
-            renderDynamicParams();
-            scheduleSave();
-        };
-    });
-    dynamicParams.querySelectorAll('[data-video-seed]').forEach(input => {
-        input.onclick = event => event.stopPropagation();
-        input.oninput = input.onchange = event => {
-            event?.stopPropagation?.();
-            settings.videoSeed = normalizeVideoSeed(input.value);
-            input.value = String(settings.videoSeed);
-            persistActiveSmartSettings();
-            scheduleSave();
-        };
-    });
-    dynamicParams.querySelectorAll('[data-video-seed-random]').forEach(btn => {
-        btn.onclick = event => {
-            event.preventDefault();
-            event.stopPropagation();
-            const wasRandom = settings.videoSeedRandom !== false;
-            if(wasRandom){
-                const input = dynamicParams.querySelector('[data-video-seed]');
-                settings.videoSeed = normalizeVideoSeed(input?.value ?? settings.videoSeed);
-                settings.videoSeedRandom = false;
-            } else {
-                settings.videoSeedRandom = true;
             }
             persistActiveSmartSettings();
             renderDynamicParams();
@@ -17235,9 +17175,6 @@ async function runRunningHubGeneration(prompt, refs, runSettings=settings){
 async function runApiVideoGeneration(prompt, refs, runSettings=settings){
     if(!runSettings.videoModel) throw new Error(tr('smart.errNoVideoModel'));
     try {
-        const includeVideoSeed = videoSeedSupported(runSettings.videoProvider, runSettings.videoModel);
-        const videoSeed = includeVideoSeed ? resolveVideoSeed(runSettings) : null;
-        if(includeVideoSeed) settings.videoSeed = videoSeed;
         const uploadedRefs = applyUploadedUrlsToSmartRefs(refs, runSettings);
         const trustedMode = Boolean(runSettings.videoTrustedAsset);
         const trustedSource = trustedMode ? (['library','cloud','manual'].includes(runSettings.videoTrustedSource) ? runSettings.videoTrustedSource : 'library') : 'none';
@@ -17284,8 +17221,7 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
             camerafixed: Boolean(runSettings.videoCameraFixed),
             generate_audio: Boolean(runSettings.videoGenerateAudio),
             multimodal: Boolean(runSettings.videoMultimodal),
-            trusted_asset: useAssetUris,
-            ...(includeVideoSeed ? {seed:videoSeed} : {})
+            trusted_asset: useAssetUris
         };
         const result = await fetch('/api/canvas-video', {
             method:'POST',

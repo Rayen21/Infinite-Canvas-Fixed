@@ -562,7 +562,7 @@ const DEFAULT_VIDEO_MODELS = [
     'doubao-seedance-1-0-lite-t2v-250428',
     'doubao-seedance-1-0-lite-i2v-250428',
     // Agnes
-    'agnes-video-v2.0', 'agnes-video-2.5-flash'
+    'agnes-video-v2.0'
 ];
 
 function uid(prefix='n'){ return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now()}`; }
@@ -736,19 +736,6 @@ function normalizeDrawThingsSeed(value){
     if(!Number.isFinite(num)) return drawThingsRandomSeed();
     return Math.max(1, Math.min(4294967295, Math.floor(num)));
 }
-function videoNodeRandomSeed(){ return Math.floor(Math.random() * 4294967295) + 1; }
-function normalizeVideoNodeSeed(value){
-    const num = Number(value);
-    if(!Number.isFinite(num) || num < 1) return videoNodeRandomSeed();
-    return Math.min(4294967295, Math.floor(num));
-}
-function resolveVideoNodeSeed(node){
-    const seed = node.videoSeedRandom !== false
-        ? videoNodeRandomSeed()
-        : normalizeVideoNodeSeed(node.videoSeed);
-    node.videoSeed = seed;
-    return seed;
-}
 // 普通画布只在随机模式下显示本次实际提交的 seed；固定模式必须保留用户输入，供指纹缓存复用。
 function applyDrawThingsSeedToGenerator(gen, seeds=[]){
     if(!gen || gen.drawThingsSeedRandom === false || !Array.isArray(seeds) || !seeds.length) return;
@@ -853,12 +840,6 @@ function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
     return uniqueModels(provider?.video_models || []);
-}
-function videoSeedSupported(providerId, model){
-    const provider = apiProviders.find(p => p.id === providerId) || {};
-    const values = [providerId, provider.id, provider.name, provider.protocol, provider.base_url, model]
-        .map(value => String(value || '').trim().toLowerCase());
-    return values.some(value => value.includes('agnes')) || values.some(value => value.startsWith('agnes-video-'));
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
@@ -2723,8 +2704,6 @@ function addVideoNode(point){
         apiProvider:providerId,
         model:models[0] || videoModels[0] || DEFAULT_VIDEO_MODELS[0],
         duration:5,
-        videoSeed:videoNodeRandomSeed(),
-        videoSeedRandom:true,
         aspectRatio:'16:9',
         resolution:'',
         enhancePrompt:false,
@@ -8864,8 +8843,6 @@ function renderVideoBody(node){
     const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
     sanitizeVideoNodeProviderModel(node);
     node.model = node.model || 'veo3-fast';
-    node.videoSeed = normalizeVideoNodeSeed(node.videoSeed);
-    const showVideoSeed = videoSeedSupported(node.apiProvider, node.model);
     wrap.innerHTML = `
         <div class="prompt-list mb-3"></div>
         <div class="video-input-head">
@@ -8911,15 +8888,6 @@ function renderVideoBody(node){
                     </select>
                 </label>
             </div>
-            <div class="gen-settings-row">
-                ${showVideoSeed ? `<label class="field video-seed-field" style="flex:1">
-                    <div class="setting-title">${tr('canvas.videoSeed')}</div>
-                    <div class="num-with-dice">
-                        <input class="setting-input video-seed" type="number" min="1" max="4294967295" step="1" value="${Number(node.videoSeed)}">
-                        <button type="button" class="tool-btn comfy-random-btn video-seed-random ${node.videoSeedRandom !== false ? 'active' : ''}" title="${node.videoSeedRandom !== false ? '随机已开启，点击关闭' : '随机已关闭，点击开启'}" aria-label="${node.videoSeedRandom !== false ? '随机已开启，点击关闭' : '随机已关闭，点击开启'}"><i data-lucide="dice-5" class="w-4 h-4"></i></button>
-                    </div>
-                </label>` : ''}
-            </div>
             <div class="gen-settings-row" style="flex-wrap:wrap">
                 <button type="button" class="setting-check ${node.enhancePrompt ? 'active' : ''}" data-video-toggle="enhancePrompt"><span class="check-dot"></span>${tr('canvas.videoEnhancePrompt')}</button>
                 <button type="button" class="setting-check ${node.enableUpsample ? 'active' : ''}" data-video-toggle="enableUpsample"><span class="check-dot"></span>${tr('canvas.videoUpsample')}</button>
@@ -8941,14 +8909,11 @@ function renderVideoBody(node){
     const durationSelect = wrap.querySelector('.video-duration');
     const aspectSelect = wrap.querySelector('.video-aspect');
     const resolutionSelect = wrap.querySelector('.video-resolution');
-    const seedInput = wrap.querySelector('.video-seed');
-    const seedRandomButton = wrap.querySelector('.video-seed-random');
     providerSelect.value = node.apiProvider;
     durationSelect.value = String(node.duration || 5);
     aspectSelect.value = node.aspectRatio || '16:9';
     resolutionSelect.value = node.resolution || '';
-    [providerSelect, modelSelect, durationSelect, aspectSelect, resolutionSelect, seedInput, seedRandomButton].forEach(input => {
-        if(!input) return;
+    [providerSelect, modelSelect, durationSelect, aspectSelect, resolutionSelect].forEach(input => {
         input.onmousedown = e => e.stopPropagation();
         input.onclick = e => e.stopPropagation();
     });
@@ -8958,34 +8923,13 @@ function renderVideoBody(node){
         const models = providerVideoModels(node.apiProvider);
         if(!models.includes(node.model)) node.model = models[0] || node.model;
         modelSelect.innerHTML = videoModelOptions(node.model, node.apiProvider);
-        render();
         scheduleSave();
     };
-    modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; render(); scheduleSave(); };
+    modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; scheduleSave(); };
     durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(60, Number(e.target.value || 5))); scheduleSave(); };
     durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(60, Number(node.duration || 5)))); };
     aspectSelect.onchange = e => { e.stopPropagation(); node.aspectRatio = e.target.value; scheduleSave(); };
     resolutionSelect.onchange = e => { e.stopPropagation(); node.resolution = e.target.value; scheduleSave(); };
-    if(seedInput && seedRandomButton){
-        seedInput.oninput = e => {
-            e.stopPropagation();
-            node.videoSeed = normalizeVideoNodeSeed(e.target.value);
-            e.target.value = String(node.videoSeed);
-            scheduleSave();
-        };
-        seedInput.onblur = e => { e.target.value = String(normalizeVideoNodeSeed(node.videoSeed)); };
-        seedRandomButton.onclick = e => {
-            e.stopPropagation();
-            if(node.videoSeedRandom !== false){
-                node.videoSeed = normalizeVideoNodeSeed(seedInput.value);
-                node.videoSeedRandom = false;
-            } else {
-                node.videoSeedRandom = true;
-            }
-            render();
-            scheduleSave();
-        };
-    }
     wrap.querySelectorAll('[data-video-toggle]').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
         btn.onclick = e => {
@@ -11915,9 +11859,6 @@ async function runVideoNode(nodeId, opts={}){
     if(node.useFrameRoles && refs[0]) refs[0] = {...refs[0], role:'first_frame'};
     if(node.useFrameRoles && refs[1]) refs[1] = {...refs[1], role:'last_frame'};
     if(!prompt){ alert(tr('canvas.videoNeedsPrompt')); return; }
-    const videoProviderId = resolveVideoProviderId(node.apiProvider || 'comfly');
-    const includeVideoSeed = videoSeedSupported(videoProviderId, node.model);
-    const videoSeed = includeVideoSeed ? resolveVideoNodeSeed(node) : null;
     let out = outputForNode(node, 460);
     const pendingId = uid('p');
     const run = runSnapshot(node, prompt, refs);
@@ -11930,7 +11871,7 @@ async function runVideoNode(nodeId, opts={}){
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({
                 prompt,
-                provider_id:videoProviderId,
+                provider_id:resolveVideoProviderId(node.apiProvider || 'comfly'),
                 model:node.model || 'veo3-fast',
                 duration:Number(node.duration || 5),
                 aspect_ratio:node.aspectRatio || '16:9',
@@ -11945,8 +11886,7 @@ async function runVideoNode(nodeId, opts={}){
                 watermark:Boolean(node.watermark),
                 camerafixed:Boolean(node.cameraFixed),
                 generate_audio:Boolean(node.generateAudio),
-                multimodal:Boolean(node.multimodal),
-                ...(includeVideoSeed ? {seed:videoSeed} : {})
+                multimodal:Boolean(node.multimodal)
             })
         }, {cascadeTargetId}).then(async r => { if(!r.ok) throw new Error(await responseErrorMessage(r, tr('canvas.videoFailed'))); return r.json(); });
         const meta = collectRunMeta(out, pendingId);
