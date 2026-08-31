@@ -58,3 +58,7 @@ CODE_CHANGE_GUARDRAILS.md
 
 # Local backup snapshots
 /data-bakup/
+
+# Local macOS startup scripts (do not sync)
+mac-启动服务(conda) 2.command
+mac-启动服务(conda).command
