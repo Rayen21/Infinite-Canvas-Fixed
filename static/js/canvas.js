@@ -562,7 +562,7 @@ const DEFAULT_VIDEO_MODELS = [
     'doubao-seedance-1-0-lite-t2v-250428',
     'doubao-seedance-1-0-lite-i2v-250428',
     // Agnes
-    'agnes-video-v2.0'
+    'agnes-video-v2.0', 'agnes-video-2.5-flash'
 ];
 
 function uid(prefix='n'){ return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now()}`; }
@@ -840,6 +840,32 @@ function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
     return uniqueModels(provider?.video_models || []);
+}
+function isAgnesVideoModel(model){
+    return String(model || '').trim().toLowerCase().startsWith('agnes-video-');
+}
+function normalizeAgnesVideoSeed(value){
+    if(value === '' || value === null || value === undefined) return null;
+    const number = Number(value);
+    if(!Number.isFinite(number)) return null;
+    return Math.max(0, Math.min(4294967295, Math.floor(number)));
+}
+function randomAgnesVideoSeed(){
+    if(globalThis.crypto?.getRandomValues){
+        const values = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(values);
+        return values[0];
+    }
+    return Math.floor(Math.random() * 4294967296);
+}
+// Agnes 的骰子是持久开关：默认每次生成随机，关闭后固定当前 seed。
+function prepareAgnesVideoSeed(target){
+    if(!target || !isAgnesVideoModel(target.model)) return null;
+    const randomEnabled = target.seedRandom !== false;
+    const current = normalizeAgnesVideoSeed(target.seed);
+    target.seedRandom = randomEnabled;
+    target.seed = randomEnabled || current === null ? randomAgnesVideoSeed() : current;
+    return target.seed;
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
@@ -2706,6 +2732,8 @@ function addVideoNode(point){
         duration:5,
         aspectRatio:'16:9',
         resolution:'',
+        seed:null,
+        seedRandom:true,
         enhancePrompt:false,
         enableUpsample:false,
         watermark:false,
@@ -8843,6 +8871,10 @@ function renderVideoBody(node){
     const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
     sanitizeVideoNodeProviderModel(node);
     node.model = node.model || 'veo3-fast';
+    if(isAgnesVideoModel(node.model)){
+        node.seedRandom = node.seedRandom !== false;
+        if(normalizeAgnesVideoSeed(node.seed) === null) node.seed = randomAgnesVideoSeed();
+    }
     wrap.innerHTML = `
         <div class="prompt-list mb-3"></div>
         <div class="video-input-head">
@@ -8887,6 +8919,13 @@ function renderVideoBody(node){
                         <option value="780P">780P</option>
                     </select>
                 </label>
+                <label class="field video-seed-field" style="flex:1;display:${isAgnesVideoModel(node.model) ? '' : 'none'}">
+                    <div class="setting-title">Agnes Seed（可选）</div>
+                    <div style="display:flex;gap:6px;align-items:center">
+                    <input class="setting-input video-seed" type="number" min="0" max="4294967295" step="1" value="${node.seed ?? ''}" placeholder="服务端随机">
+                        <button type="button" class="dice-btn video-seed-random ${node.seedRandom !== false ? 'active' : ''}" title="${node.seedRandom !== false ? '随机已开启，点击关闭' : '随机已关闭，点击开启'}" aria-label="Agnes Seed 随机开关"><i data-lucide="dice-5"></i></button>
+                    </div>
+                </label>
             </div>
             <div class="gen-settings-row" style="flex-wrap:wrap">
                 <button type="button" class="setting-check ${node.enhancePrompt ? 'active' : ''}" data-video-toggle="enhancePrompt"><span class="check-dot"></span>${tr('canvas.videoEnhancePrompt')}</button>
@@ -8909,11 +8948,29 @@ function renderVideoBody(node){
     const durationSelect = wrap.querySelector('.video-duration');
     const aspectSelect = wrap.querySelector('.video-aspect');
     const resolutionSelect = wrap.querySelector('.video-resolution');
+    const seedInput = wrap.querySelector('.video-seed');
+    const seedRandomButton = wrap.querySelector('.video-seed-random');
+    const seedField = wrap.querySelector('.video-seed-field');
+    const updateSeedVisibility = () => {
+        const visible = isAgnesVideoModel(node.model);
+        const randomEnabled = node.seedRandom !== false;
+        if(seedField) seedField.style.display = visible ? '' : 'none';
+        if(seedInput){
+            seedInput.readOnly = randomEnabled;
+            seedInput.title = randomEnabled ? '随机模式：每次生成前自动换 Seed' : '固定模式：使用当前 Seed';
+        }
+        if(seedRandomButton){
+            seedRandomButton.classList.toggle('active', randomEnabled);
+            seedRandomButton.title = randomEnabled ? '随机已开启，点击关闭并锁定当前 Seed' : '随机已关闭，点击开启';
+            seedRandomButton.setAttribute('aria-label', seedRandomButton.title);
+        }
+    };
     providerSelect.value = node.apiProvider;
     durationSelect.value = String(node.duration || 5);
     aspectSelect.value = node.aspectRatio || '16:9';
     resolutionSelect.value = node.resolution || '';
-    [providerSelect, modelSelect, durationSelect, aspectSelect, resolutionSelect].forEach(input => {
+    if(seedInput) seedInput.value = node.seed == null ? '' : String(node.seed);
+    [providerSelect, modelSelect, durationSelect, aspectSelect, resolutionSelect, seedInput, seedRandomButton].filter(Boolean).forEach(input => {
         input.onmousedown = e => e.stopPropagation();
         input.onclick = e => e.stopPropagation();
     });
@@ -8922,14 +8979,41 @@ function renderVideoBody(node){
         node.apiProvider = e.target.value;
         const models = providerVideoModels(node.apiProvider);
         if(!models.includes(node.model)) node.model = models[0] || node.model;
+        if(isAgnesVideoModel(node.model)){
+            node.seedRandom = node.seedRandom !== false;
+            if(normalizeAgnesVideoSeed(node.seed) === null) node.seed = randomAgnesVideoSeed();
+        }
         modelSelect.innerHTML = videoModelOptions(node.model, node.apiProvider);
+        updateSeedVisibility();
         scheduleSave();
     };
-    modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; scheduleSave(); };
+    modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; if(isAgnesVideoModel(node.model)){ node.seedRandom = node.seedRandom !== false; if(normalizeAgnesVideoSeed(node.seed) === null) node.seed = randomAgnesVideoSeed(); } updateSeedVisibility(); if(seedInput) seedInput.value = node.seed == null ? '' : String(node.seed); scheduleSave(); };
     durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(60, Number(e.target.value || 5))); scheduleSave(); };
     durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(60, Number(node.duration || 5)))); };
     aspectSelect.onchange = e => { e.stopPropagation(); node.aspectRatio = e.target.value; scheduleSave(); };
     resolutionSelect.onchange = e => { e.stopPropagation(); node.resolution = e.target.value; scheduleSave(); };
+    if(seedInput) seedInput.oninput = e => {
+        e.stopPropagation();
+        const normalized = normalizeAgnesVideoSeed(e.target.value);
+        node.seed = normalized === null ? (normalizeAgnesVideoSeed(node.seed) ?? randomAgnesVideoSeed()) : normalized;
+        node.seedRandom = false;
+        e.target.value = String(node.seed);
+        updateSeedVisibility();
+        scheduleSave();
+    };
+    if(seedRandomButton) seedRandomButton.onclick = e => {
+        e.stopPropagation();
+        const wasRandom = node.seedRandom !== false;
+        if(wasRandom){
+            node.seed = normalizeAgnesVideoSeed(node.seed) ?? randomAgnesVideoSeed();
+            node.seedRandom = false;
+        } else {
+            node.seedRandom = true;
+        }
+        if(seedInput) seedInput.value = node.seed == null ? '' : String(node.seed);
+        updateSeedVisibility();
+        scheduleSave();
+    };
     wrap.querySelectorAll('[data-video-toggle]').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
         btn.onclick = e => {
@@ -8969,6 +9053,7 @@ function renderVideoBody(node){
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
     bindCascadeButtons(wrap, node.id);
+    updateSeedVisibility();
     return wrap;
 }
 function miniMaxEngine(node){
@@ -11859,6 +11944,7 @@ async function runVideoNode(nodeId, opts={}){
     if(node.useFrameRoles && refs[0]) refs[0] = {...refs[0], role:'first_frame'};
     if(node.useFrameRoles && refs[1]) refs[1] = {...refs[1], role:'last_frame'};
     if(!prompt){ alert(tr('canvas.videoNeedsPrompt')); return; }
+    const videoSeed = isAgnesVideoModel(node.model) ? prepareAgnesVideoSeed(node) : null;
     let out = outputForNode(node, 460);
     const pendingId = uid('p');
     const run = runSnapshot(node, prompt, refs);
@@ -11886,7 +11972,8 @@ async function runVideoNode(nodeId, opts={}){
                 watermark:Boolean(node.watermark),
                 camerafixed:Boolean(node.cameraFixed),
                 generate_audio:Boolean(node.generateAudio),
-                multimodal:Boolean(node.multimodal)
+                multimodal:Boolean(node.multimodal),
+                ...(videoSeed !== null ? {seed:videoSeed} : {})
             })
         }, {cascadeTargetId}).then(async r => { if(!r.ok) throw new Error(await responseErrorMessage(r, tr('canvas.videoFailed'))); return r.json(); });
         const meta = collectRunMeta(out, pendingId);

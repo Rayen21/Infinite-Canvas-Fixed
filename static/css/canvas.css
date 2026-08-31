@@ -703,6 +703,13 @@ body.studio-theme-dark .rh-prompt-field textarea,
 .theme-dark .mj-action-grid button:hover,.theme-dark .mj-text-action-grid button:hover,.theme-dark .mj-pan-grid button:hover,.theme-dark .mj-reroll:hover { color:#fcd34d; background:rgba(180,83,9,.22); }
 .setting-title { color:var(--faint); font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.08em; }
 .setting-input { width:100%; height:32px; border:1px solid var(--line-2); border-radius:12px; background:var(--card-solid); color:var(--text); outline:none; padding:0 10px; font-size:12px; font-weight:700; }
+.video-seed-field > div:last-child { display:flex; gap:6px; align-items:center; min-width:0; }
+.video-seed-field .video-seed { flex:1; min-width:0; }
+.video-seed-field .video-seed[readonly] { color:var(--muted); cursor:not-allowed; }
+.video-seed-field .dice-btn { width:32px; height:32px; min-width:32px; padding:0; border:1px solid var(--line-2); border-radius:10px; background:var(--card-solid); color:var(--muted); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; transition:background .14s ease, color .14s ease, border-color .14s ease; }
+.video-seed-field .dice-btn svg, .video-seed-field .dice-btn i { width:17px; height:17px; stroke-width:2.2; }
+.video-seed-field .dice-btn:hover { background:var(--soft); color:var(--text); }
+.video-seed-field .dice-btn.active { background:var(--strong); border-color:var(--strong); color:var(--strong-text); }
 .comfy-random-field { display:grid; grid-template-columns:minmax(0,1fr) 34px; gap:7px; align-items:end; width:100%; }
 .comfy-random-btn { width:32px; height:32px; min-width:32px; padding:0; border-radius:10px; background:var(--card-solid); color:var(--muted); }
 .comfy-random-btn svg { width:18px; height:18px; stroke-width:2.2; }

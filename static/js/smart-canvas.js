@@ -331,6 +331,8 @@ let settings = {
     videoDuration:5,
     videoAspect:'16:9',
     videoResolution:'',
+    videoSeed:null,
+    videoSeedRandom:true,
     videoEnhancePrompt:false,
     videoEnableUpsample:false,
     videoWatermark:false,
@@ -1203,6 +1205,13 @@ function smartSettingsForNode(node){
     }
     if(Object.prototype.hasOwnProperty.call(node?.runSettings || {}, 'drawThingsSeedRandom')){
         base.drawThingsSeedRandom = node.runSettings.drawThingsSeedRandom;
+    }
+    // Agnes 的随机开关/当前 seed 也必须优先采用当前节点设置，不能被旧输出的历史快照覆盖。
+    if(Object.prototype.hasOwnProperty.call(node?.runSettings || {}, 'videoSeed')){
+        base.videoSeed = node.runSettings.videoSeed;
+    }
+    if(Object.prototype.hasOwnProperty.call(node?.runSettings || {}, 'videoSeedRandom')){
+        base.videoSeedRandom = node.runSettings.videoSeedRandom;
     }
     normalizeSmartVideoModeSettings(base, true);
     return withOutpaintDisplaySettings(node, base);
@@ -2917,7 +2926,7 @@ function modelscopeProvider(){
 function modelscopeImageModels(){
     return modelscopeProvider()?.image_models || ['Tongyi-MAI/Z-Image-Turbo'];
 }
-const DEFAULT_VIDEO_MODELS = ['veo3-fast','veo3','sora','runway','kling','pika','minimax-video','wan-v2','seedance-1.0-pro','jimeng-vide-3.0','jimeng-video-3.0-pro'];
+const DEFAULT_VIDEO_MODELS = ['veo3-fast','veo3','sora','runway','kling','pika','minimax-video','wan-v2','seedance-1.0-pro','jimeng-vide-3.0','jimeng-video-3.0-pro','agnes-video-v2.0','agnes-video-2.5-flash'];
 function videoApiProviders(){
     const fromConfig = (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'volcengine' && (p.video_models || []).length);
     if(fromConfig.length) return fromConfig;
@@ -2932,6 +2941,50 @@ function providerVideoModels(providerId){
     const provider = videoApiProviders().find(p => p.id === providerId);
     const models = provider?.video_models || DEFAULT_VIDEO_MODELS;
     return [...new Set(models)];
+}
+function isAgnesVideoModel(model){
+    return String(model || '').trim().toLowerCase().startsWith('agnes-video-');
+}
+function normalizeAgnesVideoSeed(value){
+    if(value === '' || value === null || value === undefined) return null;
+    const number = Number(value);
+    if(!Number.isFinite(number)) return null;
+    return Math.max(0, Math.min(4294967295, Math.floor(number)));
+}
+function randomAgnesVideoSeed(){
+    if(globalThis.crypto?.getRandomValues){
+        const values = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(values);
+        return values[0];
+    }
+    return Math.floor(Math.random() * 4294967296);
+}
+// Agnes 的骰子是持久开关：默认每次生成随机，关闭后固定当前 seed。
+function prepareAgnesVideoSeed(target){
+    if(!target || !isAgnesVideoModel(target.videoModel)) return null;
+    const randomEnabled = target.videoSeedRandom !== false;
+    const current = normalizeAgnesVideoSeed(target.videoSeed);
+    target.videoSeedRandom = randomEnabled;
+    target.videoSeed = randomEnabled || current === null ? randomAgnesVideoSeed() : current;
+    return target.videoSeed;
+}
+function renderAgnesVideoSeedControl(){
+    const randomEnabled = settings.videoSeedRandom !== false;
+    settings.videoSeedRandom = randomEnabled;
+    let seed = normalizeAgnesVideoSeed(settings.videoSeed);
+    if(seed === null){
+        seed = randomAgnesVideoSeed();
+        settings.videoSeed = seed;
+    }
+    const diceTitle = randomEnabled ? '随机已开启，点击关闭并锁定当前 Seed' : '随机已关闭，点击开启';
+    // 与 Draw Things 一样直接放在一级参数栏，不再套二级弹出目录。
+    return `<div class="smart-control agnes-video-seed-control">
+        <div class="num-with-dice" title="${escapeHtml(randomEnabled ? 'Agnes Seed：随机模式' : 'Agnes Seed：固定模式')}">
+            <span class="num-label">Seed</span>
+            <input type="number" min="0" max="4294967295" step="1" data-param="videoSeed" value="${escapeHtml(seed)}" title="${escapeHtml(randomEnabled ? '随机模式：每次生成前自动换 Seed' : '固定模式：使用当前 Seed')}">
+            <button type="button" class="dice-btn ${randomEnabled ? 'active' : ''}" data-agnes-video-seed-random title="${escapeHtml(diceTitle)}" aria-label="${escapeHtml(diceTitle)}"><i data-lucide="dice-5"></i></button>
+        </div>
+    </div>`;
 }
 function volcengineVideoModels(){
     const provider = (apiProviders || []).find(p => p.id === 'volcengine');
@@ -3238,6 +3291,7 @@ function renderApiVideoParams(){
         ${renderVideoResolutionControl()}
         ${renderVideoAspectControl()}
         ${renderVideoDurationControl()}
+        ${isAgnesVideoModel(settings.videoModel) ? renderAgnesVideoSeedControl() : ''}
         ${renderVideoToggleControl('videoEnhancePrompt', tr('smart.videoEnhancePrompt'))}
         ${renderVideoToggleControl('videoEnableUpsample', tr('smart.videoUpsample'))}
         ${renderVideoToggleControl('videoGenerateAudio', tr('smart.videoGenerateAudio'))}
@@ -4433,9 +4487,10 @@ function smartComfyRandomValue(field){
     return Math.floor(value);
 }
 function setDynamicSetting(key, value){
-    const numericKeys = new Set(['count','width','height','videoDuration','enhanceStrength','enhanceUpscaleRes','editUpscaleRes','customRatioWidth','customRatioHeight','customWidth','customHeight','msCustomRatioWidth','msCustomRatioHeight','msCustomWidth','msCustomHeight']);
+    const numericKeys = new Set(['count','width','height','videoDuration','videoSeed','enhanceStrength','enhanceUpscaleRes','editUpscaleRes','customRatioWidth','customRatioHeight','customWidth','customHeight','msCustomRatioWidth','msCustomRatioHeight','msCustomWidth','msCustomHeight']);
     const layoutKeys = new Set(['provider_id','model','resolution','ratio','msgenModel','msCustomModel','msResolution','msRatio','videoProvider','videoModel','videoAspect','videoResolution','comfyMode','comfyWorkflow','quality','count','enhanceUpscaleRes','editUpscaleRes','jimengUpscaleRes','rhConfigKey','rhPayment','rhInstanceType']);
     settings[key] = numericKeys.has(key) && value !== '' ? Number(value) : value;
+    if(key === 'videoSeed') settings.videoSeed = normalizeAgnesVideoSeed(value);
     if(key === 'provider_id') settings.model = '';
     if(key === 'videoProvider') settings.videoModel = '';
     if(key === 'videoMultimodal') settings._videoMultimodalUserSet = true;
@@ -4562,7 +4617,23 @@ function bindDynamicParams(){
             if(input.dataset.param === 'videoDuration' && event?.type === 'change') renderDynamicParams();
         };
     });
-    // 智能画布的 Draw Things seed 沿用普通画布的随机开关语义，固定 seed 时批量任务共用输入值。
+    // 智能画布的 Agnes seed：默认随机，每次生成前换 seed；点击骰子锁定/解锁当前值。
+    dynamicParams.querySelectorAll('[data-agnes-video-seed-random]').forEach(btn => {
+        btn.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            const wasRandom = settings.videoSeedRandom !== false;
+            if(wasRandom){
+                settings.videoSeed = normalizeAgnesVideoSeed(settings.videoSeed) ?? randomAgnesVideoSeed();
+                settings.videoSeedRandom = false;
+            } else {
+                settings.videoSeedRandom = true;
+            }
+            persistActiveSmartSettings();
+            renderDynamicParams();
+            scheduleSave();
+        };
+    });
     dynamicParams.querySelectorAll('[data-drawthings-seed]').forEach(input => {
         input.onclick = event => event.stopPropagation();
         input.oninput = input.onchange = event => {
@@ -7459,7 +7530,14 @@ function smartRunRequestMeta(run){
         refs:s.refCount || 0
     };
     if(s.engine === 'modelscope') return {backend:'Modelscope', model:s.msgenModel || '', custom_model:s.msCustomModel || ''};
-    if(run?.kind === 'video') return {provider_id:s.videoProvider || '', model:s.videoModel || '', duration:s.videoDuration || '', aspect_ratio:s.videoAspect || '', resolution:s.videoResolution || ''};
+    if(run?.kind === 'video') return {
+        provider_id:s.videoProvider || '',
+        model:s.videoModel || '',
+        duration:s.videoDuration || '',
+        aspect_ratio:s.videoAspect || '',
+        resolution:s.videoResolution || '',
+        ...(isAgnesVideoModel(s.videoModel) && normalizeAgnesVideoSeed(s.videoSeed) !== null ? {seed:normalizeAgnesVideoSeed(s.videoSeed)} : {})
+    };
     return {provider_id:s.provider_id || '', model:s.model || '', size:run?.size || '', quality:s.quality || '', n:s.count || 1};
 }
 function smartRunSnapshot(node, prompt, refs=[], kind='image'){
@@ -16006,6 +16084,7 @@ async function generateUrlsForCurrentSettings(node, prompt, refs, runSettings=se
         return {urls, kind:mediaKindForUrls(urls, 'image'), seeds:taskResult.seeds || []};
     }
     if(isApiLikeEngine(activeSettings.engine) && activeSettings.apiKind === 'video'){
+        if(isAgnesVideoModel(activeSettings.videoModel)) prepareAgnesVideoSeed(activeSettings);
         return {urls:await runApiVideoGeneration(prompt, refs, activeSettings), kind:'video'};
     }
     if(isApiLikeEngine(activeSettings.engine)){
@@ -16710,6 +16789,13 @@ async function runGeneration(){
         settings = {...settings, ...cloneSmartSettings(runSettings)};
     }
     const meta = snapshotRunMeta(prompt, node.id, request.displayPrompt, refs);
+    if(isApiLikeEngine(runSettings.engine) && runSettings.apiKind === 'video' && isAgnesVideoModel(runSettings.videoModel)){
+        prepareAgnesVideoSeed(runSettings);
+        settings = {...settings, ...cloneSmartSettings(runSettings)};
+        // runSettings 是当前任务快照；同步回节点，确保刷新/切换节点后随机开关仍保持。
+        node.runSettings = settingsForStorage(runSettings);
+        persistActiveSmartSettings();
+    }
     const logKind = isApiLikeEngine(runSettings.engine) && runSettings.apiKind === 'video' ? 'video' : 'image';
     const runLog = smartRunSnapshot(node, prompt, refs, logKind);
     rememberRecentSmartSettings(runSettings, node);
@@ -17205,6 +17291,10 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
         const refVideos = manualVideo ? manualSmartMediaLinks(runSettings).map(item => item.url).filter(Boolean) : videoRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean);
         const refAudios = audioRefsOnly(uploadedRefs).map(ref => effUrl(ref)).filter(Boolean).slice(0, 3);
         if(mismatchedAsset) toast('部分认证素材属于其它平台，已回退为普通素材。切换到对应平台的视频接口才能用 asset:// 认证地址。');
+        const videoSeed = isAgnesVideoModel(runSettings.videoModel)
+            ? (normalizeAgnesVideoSeed(runSettings.videoSeed) ?? randomAgnesVideoSeed())
+            : null;
+        if(videoSeed !== null) runSettings.videoSeed = videoSeed;
         const payload = {
             prompt,
             provider_id: runSettings.videoProvider || 'comfly',
@@ -17221,7 +17311,8 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
             camerafixed: Boolean(runSettings.videoCameraFixed),
             generate_audio: Boolean(runSettings.videoGenerateAudio),
             multimodal: Boolean(runSettings.videoMultimodal),
-            trusted_asset: useAssetUris
+            trusted_asset: useAssetUris,
+            ...(videoSeed !== null ? {seed:videoSeed} : {})
         };
         const result = await fetch('/api/canvas-video', {
             method:'POST',

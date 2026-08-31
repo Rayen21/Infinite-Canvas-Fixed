@@ -363,7 +363,7 @@ try:
     GEMINI_CLI_DEFAULT_TIMEOUT = max(30, min(3600, int(os.getenv("GEMINI_CLI_TIMEOUT", "900"))))
 except Exception:
     GEMINI_CLI_DEFAULT_TIMEOUT = 900
-AGNES_DEFAULT_VIDEO_MODELS = ["agnes-video-v2.0"]
+AGNES_DEFAULT_VIDEO_MODELS = ["agnes-video-v2.0", "agnes-video-2.5-flash"]
 JIMENG_LEGACY_IMAGE_MODELS = {
     "jimeng-image-2k",
     "jimeng-image-4k",
@@ -6097,6 +6097,9 @@ def is_agnes_provider(provider, model=""):
     base_url = str((provider or {}).get("base_url") or "").lower()
     model_id = str(model or "").strip().lower()
     return "apihub.agnes-ai.com" in base_url or model_id.startswith("agnes-video-")
+
+def is_agnes_video_25_flash_model(model):
+    return str(model or "").strip().lower() == "agnes-video-2.5-flash"
 
 # ---- 数字人/真人认证：平台无关分发 ----
 # 认证是一个跨平台功能。每个平台用不同的资产 API 实现，但对外是统一入口。
@@ -15822,16 +15825,6 @@ async def wait_for_agnes_video_task(client, provider, video_id, model):
 
 async def generate_agnes_video(client, payload, provider, base_url, requested_model):
     model = selected_model(requested_model, "agnes-video-v2.0")
-    width, height = agnes_video_dimensions(payload.aspect_ratio, payload.resolution)
-    num_frames, frame_rate = agnes_video_frame_count(payload.duration, 24)
-    body = {
-        "model": model,
-        "prompt": str(payload.prompt or ""),
-        "width": width,
-        "height": height,
-        "num_frames": num_frames,
-        "frame_rate": frame_rate,
-    }
     image_urls = []
     image_roles = []
     for ref in (payload.images or [])[:4]:
@@ -15839,15 +15832,80 @@ async def generate_agnes_video(client, payload, provider, base_url, requested_mo
         if url:
             image_urls.append(url)
             image_roles.append(str(getattr(ref, "role", "") or "").strip().lower())
-    if len(image_urls) == 1:
-        body["image"] = image_urls[0]
-    elif len(image_urls) > 1:
-        body["extra_body"] = {"image": image_urls}
+    if is_agnes_video_25_flash_model(model):
+        if payload.videos:
+            raise HTTPException(status_code=400, detail="Agnes Video 2.5 Flash 不支持视频参考输入，请移除视频后重试。")
+        try:
+            seconds = max(4, min(12, int(payload.duration or 5)))
+        except (TypeError, ValueError):
+            seconds = 5
+        aspect_ratio = str(payload.aspect_ratio or "16:9").strip()
+        if aspect_ratio not in {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}:
+            aspect_ratio = "16:9"
         has_frame_roles = any(role in {"first_frame", "last_frame"} for role in image_roles)
-        if payload.multimodal or has_frame_roles:
-            body["extra_body"]["mode"] = "keyframes"
-    if payload.seed is not None:
-        body["seed"] = payload.seed
+        if has_frame_roles:
+            body = {
+                "model": model,
+                "prompt": str(payload.prompt or ""),
+                "mode": "keyframe",
+                "size": "720P",
+                "aspect_ratio": aspect_ratio,
+                "seconds": str(seconds),
+            }
+            for url, role in zip(image_urls, image_roles):
+                if role == "last_frame" and "last_frame" not in body:
+                    body["last_frame"] = url
+                elif "first_frame" not in body:
+                    body["first_frame"] = url
+                elif "last_frame" not in body:
+                    body["last_frame"] = url
+            if "first_frame" not in body and "last_frame" not in body:
+                raise HTTPException(status_code=400, detail="Agnes 关键帧模式至少需要一张参考图。")
+        elif image_urls or payload.audios:
+            body = {
+                "model": model,
+                "prompt": str(payload.prompt or ""),
+                "mode": "reference",
+                "size": "720P",
+                "aspect_ratio": aspect_ratio,
+                "seconds": str(seconds),
+            }
+            if image_urls:
+                body["images"] = image_urls[:5]
+            if payload.audios:
+                body["audios"] = list(payload.audios)
+        else:
+            body = {
+                "model": model,
+                "prompt": str(payload.prompt or ""),
+                "mode": "text",
+                "size": "720P",
+                "aspect_ratio": aspect_ratio,
+                "seconds": str(seconds),
+            }
+        if payload.seed is not None:
+            body["seed"] = payload.seed
+        body["n"] = 1
+    else:
+        width, height = agnes_video_dimensions(payload.aspect_ratio, payload.resolution)
+        num_frames, frame_rate = agnes_video_frame_count(payload.duration, 24)
+        body = {
+            "model": model,
+            "prompt": str(payload.prompt or ""),
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "frame_rate": frame_rate,
+        }
+        if len(image_urls) == 1:
+            body["image"] = image_urls[0]
+        elif len(image_urls) > 1:
+            body["extra_body"] = {"image": image_urls}
+            has_frame_roles = any(role in {"first_frame", "last_frame"} for role in image_roles)
+            if payload.multimodal or has_frame_roles:
+                body["extra_body"]["mode"] = "keyframes"
+        if payload.seed is not None:
+            body["seed"] = payload.seed
     submit_url = f"{base_url}/v1/videos"
     response = await client.post(submit_url, headers=api_headers(provider=provider, model=model), json=body)
     response.raise_for_status()
