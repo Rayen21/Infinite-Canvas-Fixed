@@ -578,7 +578,13 @@ function bindSmartPreviewImageFallbacks(root=document){
             if(img.dataset.previewKind === 'video'){
                 const tpl = document.createElement('template');
                 tpl.innerHTML = smartVideoFallbackHtml(original, img.dataset.itemKind || 'video', img.dataset.videoFallbackAttrs || '');
-                img.replaceWith(tpl.content.firstElementChild);
+                const newEl = tpl.content.firstElementChild;
+                // 新 video 元素也需要绑定 onclick，否则点击后无法弹出预览
+                newEl.onclick = function(e) {
+                    e.stopPropagation();
+                    smartLogPreviewNode(this.dataset.url, this.dataset.itemKind || 'video');
+                };
+                img.replaceWith(newEl);
                 return;
             }
             if(original && img.getAttribute('src') !== original) img.src = original;
