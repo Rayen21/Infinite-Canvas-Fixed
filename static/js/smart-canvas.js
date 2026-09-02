@@ -7628,7 +7628,8 @@ function cleanupSmartLogPreviewNode(){
     }
 }
 // 视频缩略图的预览 lightbox
-function openSmartLogVideoLightbox(url){
+function openSmartLogVideoLightbox(url) {
+    console.log('openSmartLogVideoLightbox called', url);
     const box = document.getElementById('smart-log-video-lightbox');
     if(!box){
         box = document.createElement('div');
@@ -7663,7 +7664,8 @@ function closeSmartLogLightbox(){
     if(img){ img.onerror = null; img.removeAttribute('src'); }
 }
 // 日志缩略图的轻量预览：只弹一张大图（不进编辑器那套裁剪/涂抹的重组件），点背景或关闭按钮即关。
-function openSmartLogLightbox(url, kind='image'){
+function openSmartLogLightbox(url, kind='image') {
+    console.log('openSmartLogLightbox called', url, kind);
     if(!url) return;
     if(kind === 'video' || outputUrlLooksVideo(url)) { return openSmartLogVideoLightbox(url); }
     let box = document.getElementById('smartLogLightbox');
@@ -7779,7 +7781,7 @@ function renderSmartCanvasLog(){
     smartLogList.querySelectorAll('[data-url]').forEach(el => {
         el.onclick = e => {
             e.stopPropagation();
-            smartLogPreviewNode(el.dataset.url, el.dataset.kind || 'image');
+            console.log('onclick clicked', el.dataset.url, el.dataset.kind); smartLogPreviewNode(el.dataset.url, el.dataset.kind || 'image');
         };
     });
     const bindLogCopy = (selector, key) => {
