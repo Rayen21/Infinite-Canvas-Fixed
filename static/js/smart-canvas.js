@@ -7635,7 +7635,7 @@ function cleanupSmartLogPreviewNode(){
 }
 // 视频缩略图的预览 lightbox
 function openSmartLogVideoLightbox(url) {
-    const box = document.getElementById('smart-log-video-lightbox');
+    let box = document.getElementById('smart-log-video-lightbox');
     if(!box){
         box = document.createElement('div');
         box.id = 'smart-log-video-lightbox';
