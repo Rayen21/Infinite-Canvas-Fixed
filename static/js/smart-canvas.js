@@ -7627,6 +7627,34 @@ function cleanupSmartLogPreviewNode(){
         smartLogPreviewRestore = null;
     }
 }
+// 视频缩略图的预览 lightbox
+function openSmartLogVideoLightbox(url){
+    const box = document.getElementById('smart-log-video-lightbox');
+    if(!box){
+        box = document.createElement('div');
+        box.id = 'smart-log-video-lightbox';
+        box.className = 'smart-log-lightbox';
+        box.innerHTML = `<video controls playsinline preload='metadata' disablepictureinpicture controlslist='nodownload noplaybackrate noremoteplayback' style='max-width:96vw;max-height:98vh;'><source src='' type='video/mp4'><button class='smart-log-lightbox-close' type='button' aria-label='关闭'><i data-lucide='x'></i></button>`;
+        document.body.appendChild(box);
+        box.addEventListener('click', e => {
+            if(e.target === box || e.target.closest('.smart-log-lightbox-close')) closeSmartLogVideoLightbox();
+        });
+    }
+    const video = box.querySelector('video');
+    video.src = displayMediaUrl({url});
+    video.onloadedmetadata = () => { video.play().catch(() => {}); };
+    box.classList.add('open');
+    refreshIcons();
+}
+
+function closeSmartLogVideoLightbox(){
+    const box = document.getElementById('smart-log-video-lightbox');
+    if(!box) return;
+    const video = box.querySelector('video');
+    if(video){ video.pause(); video.removeAttribute('src'); }
+    box.classList.remove('open');
+}
+
 function closeSmartLogLightbox(){
     const box = document.getElementById('smartLogLightbox');
     if(!box) return;
@@ -7637,7 +7665,7 @@ function closeSmartLogLightbox(){
 // 日志缩略图的轻量预览：只弹一张大图（不进编辑器那套裁剪/涂抹的重组件），点背景或关闭按钮即关。
 function openSmartLogLightbox(url, kind='image'){
     if(!url) return;
-    if(kind === 'video' || outputUrlLooksVideo(url)){ window.open(displayMediaUrl({url}), '_blank'); return; }
+    if(kind === 'video' || outputUrlLooksVideo(url)) { return openSmartLogVideoLightbox(url); }
     let box = document.getElementById('smartLogLightbox');
     if(!box){
         box = document.createElement('div');
@@ -7713,7 +7741,7 @@ function renderSmartCanvasLog(){
             const safe = escapeAttr(item.url);
             const kind = item.kind || (outputUrlLooksVideo(item.url) ? 'video' : 'image');
             const label = imageResolutionLabel(item);
-            const attrs = `data-url="${safe}" data-kind="${escapeAttr(kind)}" title="${escapeAttr(label || 'output')}" alt="output"`;
+            const attrs = `data-url="${safe}" data-kind="${escapeAttr(kind)}" data-item-kind="${escapeAttr(kind)}" title="${escapeAttr(label || 'output')}" alt="output"`;
             return kind === 'video' ? smartVideoPreviewHtml(item, 256, attrs) : smartPreviewImgHtml(item, 256, attrs);
         }).join('');
         const date = new Date(log.createdAt || Date.now()).toLocaleString(window.StudioI18n?.lang() === 'en' ? 'en-US' : 'zh-CN');
@@ -7751,7 +7779,7 @@ function renderSmartCanvasLog(){
     smartLogList.querySelectorAll('[data-url]').forEach(el => {
         el.onclick = e => {
             e.stopPropagation();
-            smartLogPreviewNode(el.dataset.url, el.dataset.itemKind || el.dataset.previewKind || 'image');
+            smartLogPreviewNode(el.dataset.url, el.dataset.kind || 'image');
         };
     });
     const bindLogCopy = (selector, key) => {
