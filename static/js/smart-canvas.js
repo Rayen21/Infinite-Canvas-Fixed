@@ -514,10 +514,10 @@ function smartVideoPreviewHtml(itemOrUrl, size=512, attrs=''){
     const preview = smartMediaPreviewUrl(itemOrUrl, size);
     return `<img src="${escapeHtml(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}" data-preview-kind="video"${attrs ? ` ${attrs}` : ''}>`;
 }
-function smartVideoFallbackHtml(url, attrs=''){
+function smartVideoFallbackHtml(url, kind='video', attrs='') {
     const original = smartOriginalMediaUrl(url);
     const src = displayMediaUrl({url:original});
-    return `<video src="${escapeHtml(src)}" data-url="${escapeAttr(original)}" muted preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"${attrs ? ` ${attrs}` : ''}></video>`;
+    return `<video src="${escapeHtml(src)}" data-url="${escapeAttr(original)}" data-item-kind="${kind}" muted preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"${attrs ? ` ${attrs}` : ''}></video>`;
 }
 function smartVideoPlayerHtml(url, attrs=''){
     const original = smartOriginalMediaUrl(url);
@@ -577,7 +577,7 @@ function bindSmartPreviewImageFallbacks(root=document){
             const original = img.dataset.originalSrc || '';
             if(img.dataset.previewKind === 'video'){
                 const tpl = document.createElement('template');
-                tpl.innerHTML = smartVideoFallbackHtml(original, img.dataset.videoFallbackAttrs || '');
+                tpl.innerHTML = smartVideoFallbackHtml(original, img.dataset.itemKind || 'video', img.dataset.videoFallbackAttrs || '');
                 img.replaceWith(tpl.content.firstElementChild);
                 return;
             }

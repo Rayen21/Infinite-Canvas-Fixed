@@ -80,10 +80,10 @@ function canvasVideoPreviewHtml(url, size=512, attrs=''){
     const eager = /\bdata-eager-preview(?:\s|=|$)/.test(attrs || '');
     return `<img loading="${eager ? 'eager' : 'lazy'}" decoding="async" src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}" data-preview-kind="video"${attrs ? ` ${attrs}` : ''}>`;
 }
-function canvasVideoFallbackHtml(url, attrs=''){
+function canvasVideoFallbackHtml(url, kind='image', attrs=''){
     const original = canvasOriginalMediaUrl(url);
     const src = canvasDisplayMediaUrl(original);
-    return `<video src="${escapeAttr(src)}" data-url="${escapeAttr(original)}" muted preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"${attrs ? ` ${attrs}` : ''}></video>`;
+    return `<video src="${escapeAttr(src)}" data-url="${escapeAttr(original)}" data-item-kind="${kind}" muted preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate noremoteplayback"${attrs ? ` ${attrs}` : ''}></video>`;
 }
 function canvasVideoPlayerHtml(url, attrs=''){
     const original = canvasOriginalMediaUrl(url);
@@ -128,7 +128,7 @@ function bindCanvasPreviewImageFallbacks(root=document){
             const original = img.dataset.originalSrc || img.dataset.url || '';
             if(img.dataset.previewKind === 'video'){
                 const video = document.createElement('template');
-                video.innerHTML = canvasVideoFallbackHtml(original, img.dataset.videoFallbackAttrs || '');
+                video.innerHTML = canvasVideoFallbackHtml(original, img.dataset.itemKind || 'video', img.dataset.videoFallbackAttrs || '');
                 img.replaceWith(video.content.firstElementChild);
                 return;
             }
@@ -13685,7 +13685,9 @@ function missingAssetHtml(url, compact=false){
 }
 function outputMetaFor(url, out){
     const item = (out?.images || []).find(x => outputUrlValue(x) === url);
-    return item && typeof item === 'object' ? item : {};
+    if(item && typeof item === 'object') return item;
+    if(out && typeof out === 'object' && out.kind) return {kind: out.kind};
+    return {};
 }
 function runSnapshot(node, prompt, refs=[]){
     const clone = JSON.parse(JSON.stringify(node || {}));
@@ -13863,13 +13865,14 @@ function renderCanvasLog(){
         const logOutputs = Array.isArray(log.outputs) && log.outputs.length
             ? log.outputs
             : (Array.isArray(log.items) ? log.items : (Array.isArray(log.images) ? log.images : []));
-        const thumbs = logOutputs.slice(0, 8).map(item => {
+        const thumbs = logOutputs.slice(0, 8).map((item, idx) => {
             const url = outputUrlValue(item);
             if(!url) return '';
             const safe = escapeAttr(url);
             if(isMissingAssetUrl(url)) return `<div class="missing-asset compact" data-url="${safe}"><i data-lucide="image-off" class="w-4 h-4"></i></div>`;
             const kind = mediaKindForOutputItem(item);
-            return kind === 'video' ? canvasVideoPreviewHtml(url, 256, 'alt="output" data-eager-preview="1"') : canvasPreviewImgHtml(url, 256, 'alt="output" data-eager-preview="1"');
+            const dataAttrs = `data-eager-preview="1" data-item-kind="${kind}"`;
+            return kind === 'video' ? canvasVideoPreviewHtml(url, 256, `alt="output" ${dataAttrs}`) : canvasPreviewImgHtml(url, 256, `alt="output" ${dataAttrs}`);
         }).join('');
         const date = new Date(log.createdAt || Date.now()).toLocaleString(window.StudioI18n?.lang() === 'en' ? 'en-US' : 'zh-CN');
         const req = log.request || {};
@@ -13909,7 +13912,7 @@ function renderCanvasLog(){
     list.querySelectorAll('[data-url]').forEach(el => {
         el.onclick = e => {
             e.stopPropagation();
-            openOutputLightbox(el.dataset.url, null);
+            openOutputLightbox(el.dataset.url, {url: el.dataset.url, kind: el.dataset.itemKind || 'auto'});
         };
     });
     const bindCanvasLogCopy = (selector, key) => {
