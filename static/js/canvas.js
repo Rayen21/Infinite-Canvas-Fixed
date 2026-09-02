@@ -13912,7 +13912,7 @@ function renderCanvasLog(){
     list.querySelectorAll('[data-url]').forEach(el => {
         el.onclick = e => {
             e.stopPropagation();
-            console.log('canvas onclick clicked', el.dataset.url, el.dataset.itemKind); openOutputLightbox(el.dataset.url, {url: el.dataset.url, kind: el.dataset.itemKind || 'auto'});
+            openOutputLightbox(el.dataset.url, {url: el.dataset.url, kind: el.dataset.itemKind || 'auto'});
         };
     });
     const bindCanvasLogCopy = (selector, key) => {
