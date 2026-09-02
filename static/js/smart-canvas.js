@@ -7751,7 +7751,7 @@ function renderSmartCanvasLog(){
     smartLogList.querySelectorAll('[data-url]').forEach(el => {
         el.onclick = e => {
             e.stopPropagation();
-            smartLogPreviewNode(el.dataset.url, el.dataset.kind || 'image');
+            smartLogPreviewNode(el.dataset.url, el.dataset.itemKind || el.dataset.previewKind || 'image');
         };
     });
     const bindLogCopy = (selector, key) => {
