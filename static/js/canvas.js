@@ -129,7 +129,12 @@ function bindCanvasPreviewImageFallbacks(root=document){
             if(img.dataset.previewKind === 'video'){
                 const video = document.createElement('template');
                 video.innerHTML = canvasVideoFallbackHtml(original, img.dataset.itemKind || 'video', img.dataset.videoFallbackAttrs || '');
-                img.replaceWith(video.content.firstElementChild);
+                const videoEl = video.content.firstElementChild;
+                img.replaceWith(videoEl);
+                videoEl.onclick = e => {
+                    e.stopPropagation();
+                    openOutputLightbox(videoEl.dataset.url, {url: videoEl.dataset.url, kind: videoEl.dataset.itemKind || 'auto'});
+                };
                 return;
             }
             if(original && img.getAttribute('src') !== original) img.src = original;

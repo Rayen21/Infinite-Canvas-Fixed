@@ -9,4 +9,5 @@ requests
 httpx
 fastapi
 python-multipart
-uvicorn
+uvicorn[standard]
+websockets

@@ -32,6 +32,7 @@ from threading import Lock, RLock, Thread
 import httpx
 from PIL import Image, ImageOps
 from io import BytesIO
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
@@ -66,7 +67,36 @@ class QuietAccessLogFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(QuietAccessLogFilter())
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global GLOBAL_LOOP
+    GLOBAL_LOOP = asyncio.get_running_loop()
+    sync_static_html_versions()
+    # 启动时整理资产库：给所有图片分组（含默认角色/场景）建好文件夹，并把根目录里的旧素材归整进去。
+    try:
+        await asyncio.to_thread(migrate_asset_library_into_dirs)
+    except Exception as exc:
+        print(f"资产库分组整理失败: {exc}")
+    # 修复历史遗留的双重扩展名素材（foo.png.png → foo.png），否则这些卡片无法显示
+    try:
+        await asyncio.to_thread(migrate_double_extension_uploads)
+    except Exception as exc:
+        print(f"修复双重扩展名素材失败: {exc}")
+    # 纠正内容与扩展名不符的图片（如 WebP 内容却叫 .png），否则严格客户端解不出来
+    try:
+        await asyncio.to_thread(migrate_mislabeled_image_extensions)
+    except Exception as exc:
+        print(f"纠正图片扩展名失败: {exc}")
+    # 启动时清除后端冷却记录，让后端检查可以立即重新进行
+    global COMFYUI_BACKEND_COOLDOWN_UNTIL
+    COMFYUI_BACKEND_COOLDOWN_UNTIL.clear()
+
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -168,35 +198,14 @@ GITHUB_VERSION_URL = "https://raw.githubusercontent.com/Rayen21/Infinite-Canvas-
 GITHUB_TREE_URL = "https://api.github.com/repos/Rayen21/Infinite-Canvas-Fixed/git/trees/main?recursive=1"
 GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/Rayen21/Infinite-Canvas-Fixed/main"
 GITHUB_UPDATE_NOTES_URL = GITHUB_RAW_ROOT + "/static/update-notes.json"
-MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/daniel8152/Infinite-Canvas"
-MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/daniel8152/Infinite-Canvas/raw/main"
+MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/Rayen21/Infinite-Canvas-Fixed"
+MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/Rayen21/Infinite-Canvas-Fixed/raw/main"
 # ModelScope 仓库默认分支为 master；raw 网页路径会返回 HTML，必须用仓库文件 API 才能拿到纯文本
 # 注意：.ai 站命名空间为小写 daniel8152，API 路径大小写敏感（推送/文件 API 用大写会 404/拒绝）
-MODELSCOPE_FILE_API_ROOT = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo?Revision=master&FilePath="
+MODELSCOPE_FILE_API_ROOT = "https://www.modelscope.ai/api/v1/studio/Rayen21/Infinite-Canvas-Fixed/repo?Revision=master&FilePath="
 MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
 MODELSCOPE_UPDATE_NOTES_URL = MODELSCOPE_FILE_API_ROOT + "static/update-notes.json"
-MODELSCOPE_TREE_URL = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
-
-@app.on_event("startup")
-async def startup_event():
-    global GLOBAL_LOOP
-    GLOBAL_LOOP = asyncio.get_running_loop()
-    sync_static_html_versions()
-    # 启动时整理资产库：给所有图片分组（含默认角色/场景）建好文件夹，并把根目录里的旧素材归整进去。
-    try:
-        await asyncio.to_thread(migrate_asset_library_into_dirs)
-    except Exception as exc:
-        print(f"资产库分组整理失败: {exc}")
-    # 修复历史遗留的双重扩展名素材（foo.png.png → foo.png），否则这些卡片无法显示
-    try:
-        await asyncio.to_thread(migrate_double_extension_uploads)
-    except Exception as exc:
-        print(f"修复双重扩展名素材失败: {exc}")
-    # 纠正内容与扩展名不符的图片（如 WebP 内容却叫 .png），否则严格客户端解不出来
-    try:
-        await asyncio.to_thread(migrate_mislabeled_image_extensions)
-    except Exception as exc:
-        print(f"纠正图片扩展名失败: {exc}")
+MODELSCOPE_TREE_URL = "https://www.modelscope.ai/api/v1/studio/Rayen21/Infinite-Canvas-Fixed/repo/files?Revision=master&Recursive=true"
 
 @app.websocket("/ws/stats")
 async def websocket_endpoint(websocket: WebSocket, client_id: str = None):
@@ -594,7 +603,8 @@ IMAGE_POLL_INTERVAL = float(os.getenv("IMAGE_POLL_INTERVAL", "2"))
 IMAGE_TASK_TIMEOUT = float(os.getenv("IMAGE_TASK_TIMEOUT", str(AI_REQUEST_TIMEOUT)))
 COMFYUI_HISTORY_TIMEOUT = int(float(os.getenv("COMFYUI_HISTORY_TIMEOUT", "1800")))
 # Cloudflare Access TCP 转发可能比局域网后端有更高的连接延迟，所有远端请求都必须有明确的单次超时。
-COMFYUI_BACKEND_CHECK_TIMEOUT = float(os.getenv("COMFYUI_BACKEND_CHECK_TIMEOUT", "5"))
+COMFYUI_BACKEND_CHECK_TIMEOUT = float(os.getenv("COMFYUI_BACKEND_CHECK_TIMEOUT", "15"))
+COMFYUI_BACKEND_INITIAL_CHECK_TIMEOUT = float(os.getenv("COMFYUI_BACKEND_INITIAL_CHECK_TIMEOUT", "10"))
 COMFYUI_HTTP_TIMEOUT = float(os.getenv("COMFYUI_HTTP_TIMEOUT", "30"))
 COMFYUI_HISTORY_REQUEST_TIMEOUT = float(os.getenv("COMFYUI_HISTORY_REQUEST_TIMEOUT", "15"))
 # 下载 ComfyUI 产物的 socket 超时（秒，作用于连接和每次 read）。结果通过 Cloudflare 隧道回传时，
@@ -605,7 +615,7 @@ COMFYUI_DOWNLOAD_RETRY_DELAY = max(0.0, float(os.getenv("COMFYUI_DOWNLOAD_RETRY_
 COMFYUI_UPLOAD_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_TIMEOUT", "60"))
 COMFYUI_UPLOAD_CONNECT_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_CONNECT_TIMEOUT", "10"))
 COMFYUI_UPLOAD_READ_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_READ_TIMEOUT", str(COMFYUI_UPLOAD_TIMEOUT)))
-COMFYUI_BACKEND_FAILURE_COOLDOWN = max(0.0, float(os.getenv("COMFYUI_BACKEND_FAILURE_COOLDOWN", "30")))
+COMFYUI_BACKEND_FAILURE_COOLDOWN = max(0.0, float(os.getenv("COMFYUI_BACKEND_FAILURE_COOLDOWN", "5")))
 APIMART_IMAGE_TASK_TIMEOUT = float(os.getenv("APIMART_IMAGE_TASK_TIMEOUT", "1800"))
 APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"))
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
@@ -3305,7 +3315,8 @@ def _can_drop_missing_workflow_link(node: Dict[str, Any], input_name: str) -> bo
         return True
     if "textencode" in class_type.lower() and normalized_input.startswith("image"):
         return True
-    return normalized_input in {"image", "image1", "image2", "image3", "image4"}
+    # Don't drop "image" input — the node should be removed entirely
+    return normalized_input in {"image1", "image2", "image3", "image4"}
 
 def prune_optional_comfy_workflow_images(
     workflow: Dict[str, Any],
@@ -3448,7 +3459,7 @@ def get_best_backend(required_images: List[str] = None):
                 f"http://{addr}/queue",
                 headers={"Connection": "close", "Cache-Control": "no-cache"},
             )
-            with urllib.request.urlopen(request, timeout=COMFYUI_BACKEND_CHECK_TIMEOUT) as response:
+            with urllib.request.urlopen(request, timeout=COMFYUI_BACKEND_INITIAL_CHECK_TIMEOUT) as response:
                 data = json.loads(response.read())
                 remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
                 with LOAD_LOCK:
@@ -3458,6 +3469,7 @@ def get_best_backend(required_images: List[str] = None):
                 backend_stats[addr] = {"load": effective_load, "has_images": has_images}
         except Exception as e:
             print(f"Backend {addr} unreachable: {e}")
+            mark_comfy_backend_failed(addr, str(e))
             continue
 
     if not backend_stats:
@@ -3481,13 +3493,14 @@ def reserve_best_backend(required_images: List[str] = None):
                 f"http://{addr}/queue",
                 headers={"Connection": "close", "Cache-Control": "no-cache"},
             )
-            with urllib.request.urlopen(request, timeout=COMFYUI_BACKEND_CHECK_TIMEOUT) as response:
+            with urllib.request.urlopen(request, timeout=COMFYUI_BACKEND_INITIAL_CHECK_TIMEOUT) as response:
                 data = json.loads(response.read())
                 remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
                 has_images = check_images_exist(addr, required_images)
                 backend_stats[addr] = {"remote_load": remote_load, "has_images": has_images}
         except Exception as e:
             print(f"Backend {addr} unreachable: {e}")
+            mark_comfy_backend_failed(addr, str(e))
             continue
     if not backend_stats:
         configured = ", ".join(COMFYUI_INSTANCES) or "未配置"
@@ -3523,7 +3536,7 @@ def get_comfy_backend_upload_order():
             response = requests.get(
                 f"http://{addr}/queue",
                 headers={"Connection": "close", "Cache-Control": "no-cache"},
-                timeout=COMFYUI_BACKEND_CHECK_TIMEOUT,
+                timeout=COMFYUI_BACKEND_INITIAL_CHECK_TIMEOUT,
             )
             response.raise_for_status()
             data = response.json()
@@ -3533,6 +3546,7 @@ def get_comfy_backend_upload_order():
             backend_stats[addr] = max(remote_load, local_load)
         except Exception as exc:
             print(f"ComfyUI upload backend unavailable {addr}: {exc}")
+            mark_comfy_backend_failed(addr, str(exc))
 
     return sorted(
         backend_stats,
@@ -19908,6 +19922,9 @@ def save_comfyui_instances(payload: ComfyInstancesPayload):
         update_env_values({"COMFYUI_INSTANCES": ",".join(cleaned)})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"写入 env 失败：{e}")
+    # 清除旧的后端冷却记录（用户更新地址后应重置所有冷却）
+    global COMFYUI_BACKEND_COOLDOWN_UNTIL
+    COMFYUI_BACKEND_COOLDOWN_UNTIL.clear()
     # 更新进程中的全局变量
     global COMFYUI_INSTANCES, COMFYUI_ADDRESS, BACKEND_LOCAL_LOAD
     COMFYUI_INSTANCES = cleaned
