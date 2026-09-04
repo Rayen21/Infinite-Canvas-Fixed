@@ -3374,7 +3374,13 @@ def prune_optional_comfy_workflow_images(
                 if _workflow_link_target(value) not in removed_nodes:
                     continue
                 if _can_drop_missing_workflow_link(node, input_name):
-                    del inputs[input_name]
+                    ct = str(node.get("class_type") or "").strip()
+                    # ComfySwitchNode: keep the input port but clear it (don't delete)
+                    # to avoid "Required input is missing" validation error
+                    if ct == "ComfySwitchNode":
+                        inputs[input_name] = ""
+                    else:
+                        del inputs[input_name]
                 elif str(node.get("class_type") or "") in PRUNABLE_WORKFLOW_IMAGE_NODE_TYPES:
                     removed_nodes.add(node_id)
                     changed = True
